@@ -4,7 +4,7 @@ sirius:
   space:
     gpu:
       - device_id: 0
-        memory_capacity: 2147483648
+        memory_capacity: 1073741824
     host:
       - numa_id: 0
-        memory_capacity: 4294967296
+        memory_capacity: 2147483648
