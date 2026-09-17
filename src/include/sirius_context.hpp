@@ -122,6 +122,8 @@ class SiriusConnectionState : public ClientContextState {
     captured_plan_.reset();
   }
 
+  [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
+
   /// \brief Store the optimizer-hook capture, stamped with the current
   /// planning generation.
   void set_captured_plan(unique_ptr<LogicalOperator> plan)

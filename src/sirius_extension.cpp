@@ -50,6 +50,8 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -74,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan/file_scan_bind_catalog.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/types.hpp>
@@ -344,7 +347,37 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                      std::move(bind_result.validation_etag),
                      std::move(bind_result.local_version)});
   }
-  return make_uniq<SiriusReadParquetBindData>(std::move(files), total_num_rows);
+  auto conn_state = get_sirius_connection_state(context);
+  if (!conn_state) {
+    throw InternalException("sirius_parquet_scan has no Sirius connection state during bind");
+  }
+  auto bound = sirius::scan::file_scan_catalog_for(context)->register_parquet_scan(
+    conn_state->planning_generation(), std::move(files), total_num_rows);
+  return make_uniq<SiriusReadParquetBindData>(std::move(bound));
+}
+
+void SiriusReadParquetSerialize(Serializer& serializer,
+                                optional_ptr<FunctionData> bind_data,
+                                TableFunction const&)
+{
+  auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data.get());
+  if (typed == nullptr || !typed->bound_scan) {
+    throw SerializationException("cannot serialize Sirius Parquet scan without bound scan data");
+  }
+  serializer.WriteProperty<uint64_t>(1000, "generation", typed->generation());
+  serializer.WriteProperty<uint64_t>(1001, "scan_instance_id", typed->scan_instance_id());
+  serializer.WriteProperty<uint64_t>(1002, "fingerprint", typed->fingerprint());
+}
+
+unique_ptr<FunctionData> SiriusReadParquetDeserialize(Deserializer& deserializer, TableFunction&)
+{
+  auto generation       = deserializer.ReadProperty<uint64_t>(1000, "generation");
+  auto scan_instance_id = deserializer.ReadProperty<uint64_t>(1001, "scan_instance_id");
+  auto fingerprint      = deserializer.ReadProperty<uint64_t>(1002, "fingerprint");
+  auto& context         = deserializer.Get<ClientContext&>();
+  auto bound = sirius::scan::file_scan_catalog_for(context)->resolve_parquet_scan(
+    generation, scan_instance_id, fingerprint);
+  return make_uniq<SiriusReadParquetBindData>(std::move(bound));
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -378,7 +411,7 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   if (bind_data_p == nullptr) { return nullptr; }
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
-  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+  return make_uniq<NodeStatistics>(typed->total_num_rows(), typed->total_num_rows());
 }
 
 struct SiriusTableFunctionData : public TableFunctionData {
@@ -2543,6 +2576,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
   sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.SetSerializeCallback(SiriusReadParquetSerialize);
+  sirius_read_parquet.SetDeserializeCallback(SiriusReadParquetDeserialize);
   sirius_read_parquet.projection_pushdown = true;
   sirius_read_parquet.filter_pushdown     = true;
   sirius_read_parquet.filter_prune        = true;
@@ -2559,6 +2594,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                       SiriusParquetScanFunction,
                                       SiriusReadParquetBind);
     sirius_parquet_scan.cardinality         = SiriusReadParquetCardinality;
+    sirius_parquet_scan.SetSerializeCallback(SiriusReadParquetSerialize);
+    sirius_parquet_scan.SetDeserializeCallback(SiriusReadParquetDeserialize);
     sirius_parquet_scan.projection_pushdown = true;
     sirius_parquet_scan.filter_pushdown     = true;
     sirius_parquet_scan.filter_prune        = true;

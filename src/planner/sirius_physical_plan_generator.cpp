@@ -85,10 +85,10 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
     // bind data rather than MultiFileBindData. Physical planning must consume
     // that bind result, not re-derive the file identity from LogicalGet parameters.
     auto const* bound = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(bind_data);
-    if (bound == nullptr || bound->files.empty()) { return {}; }
+    if (bound == nullptr || bound->files().empty()) { return {}; }
     std::vector<std::string> file_paths;
-    file_paths.reserve(bound->files.size());
-    for (auto const& file : bound->files) {
+    file_paths.reserve(bound->files().size());
+    for (auto const& file : bound->files()) {
       file_paths.push_back(file.uri);
     }
     return file_paths;
@@ -173,12 +173,12 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const* bind =
       dynamic_cast<duckdb::SiriusReadParquetBindData const*>(scan_op.bind_data.get());
-    if (!bind || bind->files.size() != info->resolved_file_paths.size()) {
+    if (!bind || bind->files().size() != info->resolved_file_paths.size()) {
       throw std::runtime_error(
         "Sirius-owned Parquet scan has no bound footer metadata for every input file");
     }
-    info->bound_files.reserve(bind->files.size());
-    for (auto const& file : bind->files) {
+    info->bound_files.reserve(bind->files().size());
+    for (auto const& file : bind->files()) {
       if (!file.file_metadata) {
         throw std::runtime_error(
           "Sirius-owned Parquet scan has an input without bound footer metadata");

@@ -26,19 +26,19 @@ execution copies.
 | `seq_scan` | DuckDB catalog bind and table storage metadata | `wrap_table_scan_source` selects the DuckDB-native ingestible | Existing native plan copy/rebind behavior; out of #1796 file binding scope |
 | `read_parquet` / `parquet_scan` | DuckDB Parquet `MultiFileBindData`; DuckDB expands files and reads metadata | `resolve_parquet_scan_file_paths` reads the bind file list, then the Parquet ingestible may fetch/parse footer metadata | Any non-copyable `LogicalGet` follows the transparent SQL re-plan branch |
 | `iceberg_scan` | DuckDB Iceberg bind resolves to `MultiFileBindData`; Sirius's Iceberg planner also discovers metadata/delete state | Parquet ingestible plus Iceberg delete metadata | `LogicalGet` is currently non-serializable in relevant cases; finalize/execution can rebind/re-discover |
-| `sirius_read_parquet` | `SiriusReadParquetBind` calls `sirius_scan_manager::describe_parquet` | `SiriusReadParquetBindData` supplies the fixed URI, footer, and row count | Its `FunctionData::Copy` preserves the footer pointer, but no query registry / serialization exists |
+| `sirius_read_parquet` / `sirius_parquet_scan` | `SiriusReadParquetBind` fixes one or more URIs (including bind-time glob expansion) and calls `sirius_scan_manager::describe_parquet` | `SiriusParquetBoundScan` owns the ordered footers/evidence; bind data, Copy and in-process logical-plan deserialization share it | The connection-local registry resolves only `(generation, scan_instance_id, fingerprint)` to the original object; no rebind, path lookup, listing or network I/O occurs during deserialization |
 
-## Sirius-owned single-file Parquet trace
+## Sirius-owned Parquet trace
 
 1. `SiriusReadParquetBind` validates the one URI and calls
    `sirius_scan_manager::describe_parquet`.
 2. `describe_parquet` opens a datasource with the footer-probe hint, obtains or
    parses `parquet_metadata`, extracts the schema and row count, and returns a
    shared `FileMetaData` object.
-3. `SiriusReadParquetBindData` retains the URI, object size, row count, and
-   that shared footer object. For local files it also retains the bind fd's
-   size/mtime_ns evidence; its cardinality callback exposes the exact footer
-   row count to DuckDB's optimizer.
+3. `SiriusParquetBoundScan` retains the ordered URI list, object sizes, total
+   row count, shared footer objects and per-file ETag/local size+mtime_ns
+   evidence. Its bind-data wrapper and cardinality callback expose the exact
+   total footer row count to DuckDB's optimizer.
 4. `populate_parquet_table_info` consumes the URI and footer from that bind
    object. It does not derive the file identity from `LogicalGet` parameters.
 5. `parquet_gpu_ingestible::build_file_scan_info` receives the bound footer and
@@ -60,9 +60,11 @@ retaining a fd across that interval; absent scan evidence emits a WARN and
 falls back to the immutable-file convention. Multi-file binding and cache
 version isolation remain future work.
 
-This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
-does not provide multi-file binding, serialization, query registry ownership,
-cache version isolation, or an Iceberg snapshot binding contract.
+This closes the explicit Sirius-owned Parquet scan-to-ingestible handoff for
+schema-identical local/S3 files, URI lists and globs. Its in-process plan-copy
+registry is now implemented. It does not provide Hive/`union_by_name`, an
+Iceberg snapshot binding contract, split ownership, or a transparent route for
+DuckDB's original file functions.
 
 ## A1 source trace: bind through execute
 
@@ -72,10 +74,10 @@ bind/optimize attempt, not merely a logical-plan copy.
 | Source / shape | Bind-time metadata | Optimizer/finalize/execution behavior | CPU replay / identity risk |
 | --- | --- | --- | --- |
 | Local `read_parquet` / `parquet_scan` | DuckDB produces `MultiFileBindData`, including its expanded files; Sirius later resolves that list and may fetch/parse each footer in `build_file_scan_info`. | The optimizer captures a plan copy. If `LogicalGet::Copy` fails, finalize validates a re-planned logical plan and execution replans SQL again. | Runtime fallback replays the original SQL. File expansion/footer work can therefore repeat; source identity is the DuckDB bind-data file list, not a Sirius handle. |
-| S3 `read_parquet` rewritten to `sirius_read_parquet` | Sirius bind does a footer Range GET and records URI, parsed footer, size and ETag. | Copy preserves this bind payload when DuckDB can copy it. The non-copyable path still reparses/rebinds SQL at execution. | S3 CPU fallback is intentionally rejected; a rebind can nevertheless repeat the footer probe. |
+| S3 `read_parquet` rewritten to `sirius_read_parquet` / explicit `sirius_parquet_scan` | Sirius bind does footer Range GETs and records the resolved ordered URI list, parsed footers, sizes and ETags. | Table-function serialization carries only the generation/scan handle/fingerprint and resolves the same in-process payload. | S3 CPU fallback is intentionally rejected. A new prepared execution is a new bind generation and can repeat footer probes; a same-generation plan copy cannot. |
 | `iceberg_scan` | DuckDB binds `MultiFileBindData`; Sirius additionally invokes Iceberg metadata/delete discovery and schema gates. | The same non-copyable `LogicalGet` finalize/execution replan branch applies. | A replay/redrive can rediscover table metadata, manifests and deletes; current source identity is path/bind data, not a fixed snapshot handle. |
 | View over a file source | The view body is bound as part of the outer query and follows its underlying source row above. | Optimizer capture and any SQL replan bind the view body again. | The view name is not a stable file-source identity; the underlying table function/bind data is. |
-| Prepared statement, including self-join | Prepare performs the initial bind/finalize. Every execution of a Sirius-backed prepared plan requests `ATTEMPT_TO_REBIND`, so it receives a fresh bind/optimize/finalize attempt. A self-join has two `LogicalGet` consumers and must eventually receive two consumption contracts, even where their source is identical. | Each execution is the current practical generation boundary, but no generation-scoped scan registry exists. | CPU-only prepared plans can remain cached; Sirius-backed ones deliberately rebind to re-evaluate eligibility. |
+| Prepared statement, including self-join | Prepare performs the initial bind/finalize. Every execution of a Sirius-backed prepared plan requests `ATTEMPT_TO_REBIND`, so it receives a fresh bind/optimize/finalize attempt. A self-join has two `LogicalGet` consumers and therefore receives two scan instance IDs, even where their source is identical. | Each execution is the practical generation boundary. The Sirius-owned Parquet registry resolves same-generation copies; Iceberg and DuckDB-bound file functions still have no registry. | CPU-only prepared plans can remain cached; Sirius-backed ones deliberately rebind to re-evaluate eligibility. |
 
 `sirius_optimizer_hook` records a copy stamped with the connection planning
 generation. `OnFinalizePrepare` consumes that capture; if copying a logical get

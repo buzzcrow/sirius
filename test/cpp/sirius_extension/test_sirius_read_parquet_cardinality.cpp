@@ -6,6 +6,7 @@
  */
 
 #include "catch.hpp"
+#include "scan/file_scan_bind_catalog.hpp"
 #include "sirius_extension.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
@@ -41,22 +42,23 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   duckdb::SiriusReadParquetBindData bind_data{"s3://bucket/orders.parquet", orders_row_count,
                                              footer, orders_object_size, orders_etag};
 
-  CHECK(bind_data.uri == "s3://bucket/orders.parquet");
-  CHECK(bind_data.total_num_rows == orders_row_count);
-  CHECK(bind_data.object_size == orders_object_size);
-  CHECK(bind_data.validation_etag == orders_etag);
-  CHECK_FALSE(bind_data.local_version.available);
+  CHECK(bind_data.uri() == "s3://bucket/orders.parquet");
+  CHECK(bind_data.total_num_rows() == orders_row_count);
+  CHECK(bind_data.object_size() == orders_object_size);
+  CHECK(bind_data.validation_etag() == orders_etag);
+  CHECK_FALSE(bind_data.local_version().available);
 
   auto copy = bind_data.Copy();
   REQUIRE(copy != nullptr);
   auto* typed_copy = dynamic_cast<duckdb::SiriusReadParquetBindData*>(copy.get());
   REQUIRE(typed_copy != nullptr);
-  CHECK(typed_copy->uri == bind_data.uri);
-  CHECK(typed_copy->total_num_rows == bind_data.total_num_rows);
-  CHECK(typed_copy->file_metadata == footer);
-  CHECK(typed_copy->object_size == orders_object_size);
-  CHECK(typed_copy->validation_etag == orders_etag);
-  CHECK_FALSE(typed_copy->local_version.available);
+  CHECK(typed_copy->bound_scan == bind_data.bound_scan);
+  CHECK(typed_copy->uri() == bind_data.uri());
+  CHECK(typed_copy->total_num_rows() == bind_data.total_num_rows());
+  CHECK(typed_copy->file_metadata() == footer);
+  CHECK(typed_copy->object_size() == orders_object_size);
+  CHECK(typed_copy->validation_etag() == orders_etag);
+  CHECK_FALSE(typed_copy->local_version().available);
   CHECK(bind_data.Equals(*copy));
 
   duckdb::SiriusReadParquetBindData different_uri{"s3://bucket/lineitem.parquet", orders_row_count};
@@ -89,7 +91,7 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   REQUIRE(local_copy != nullptr);
   auto* typed_local_copy = dynamic_cast<duckdb::SiriusReadParquetBindData*>(local_copy.get());
   REQUIRE(typed_local_copy != nullptr);
-  CHECK(typed_local_copy->local_version == orders_local_version);
+  CHECK(typed_local_copy->local_version() == orders_local_version);
   CHECK(local_bind.Equals(*local_copy));
 
   duckdb::SiriusReadParquetBindData different_local_version{
@@ -122,6 +124,40 @@ TEST_CASE("SiriusReadParquetCardinality returns exact DuckDB node statistics",
   CHECK(stats->estimated_cardinality == orders_row_count);
   CHECK(stats->has_max_cardinality);
   CHECK(stats->max_cardinality == orders_row_count);
+}
+
+TEST_CASE("Sirius file scan binding catalog resolves the same immutable payload",
+          "[planner-metadata][sirius_read_parquet]")
+{
+  sirius::scan::file_scan_bind_catalog catalog;
+  auto footer = std::make_shared<cudf::io::parquet::FileMetaData const>();
+  auto bound  = catalog.register_parquet_scan(
+    /*generation=*/7,
+    {{"s3://bucket/orders.parquet", footer, orders_object_size, orders_etag, {}}},
+    orders_row_count);
+
+  REQUIRE(bound != nullptr);
+  CHECK(bound->generation == 7);
+  CHECK(bound->files.size() == 1);
+  CHECK(bound->files.front().file_metadata == footer);
+  CHECK(catalog.resolve_parquet_scan(bound->generation, bound->scan_instance_id, bound->fingerprint) ==
+        bound);
+
+  // A new generation releases the catalog's old reference and must never make
+  // an old handle resolve to a newer path/version binding.
+  auto newer = catalog.register_parquet_scan(
+    /*generation=*/8,
+    {{"s3://bucket/orders.parquet", footer, orders_object_size, "\"orders-v2\"", {}}},
+    orders_row_count);
+  REQUIRE(newer != nullptr);
+  CHECK_THROWS_AS(catalog.resolve_parquet_scan(bound->generation,
+                                               bound->scan_instance_id,
+                                               bound->fingerprint),
+                  duckdb::SerializationException);
+  CHECK_THROWS_AS(catalog.resolve_parquet_scan(newer->generation,
+                                               newer->scan_instance_id,
+                                               newer->fingerprint + 1),
+                  duckdb::SerializationException);
 }
 
 TEST_CASE("SiriusReadParquetCardinality handles absent or wrong bind data defensively",

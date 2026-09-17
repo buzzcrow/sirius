@@ -22,6 +22,7 @@
 #include "io/file_version.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -69,10 +70,26 @@ struct SiriusParquetFileBindData {
   }
 };
 
-// Bind-time payload for the sirius_read_parquet table function. Carries the
-// canonical ordered file list and parquet footer row count. The physical
-// planner consumes these bound objects directly, while DuckDB's optimizer sees
-// a real cardinality estimate via the registered callback.
+/// Immutable, connection-generation-local result of a Sirius-owned Parquet
+/// bind.  A logical-plan copy must retain this object rather than copy its
+/// parsed footer payload or bind the URI again.
+struct SiriusParquetBoundScan {
+  SiriusParquetBoundScan() = default;
+  SiriusParquetBoundScan(std::vector<SiriusParquetFileBindData> files, std::size_t total_num_rows)
+    : files(std::move(files)), total_num_rows(total_num_rows)
+  {
+  }
+
+  uint64_t generation{0};
+  uint64_t scan_instance_id{0};
+  uint64_t fingerprint{0};
+  std::vector<SiriusParquetFileBindData> files;
+  std::size_t total_num_rows{0};
+};
+
+// Lightweight table-function payload for a Sirius-owned Parquet scan. The
+// shared BoundScan carries the canonical ordered file list and parsed footers;
+// Copy() and table-function deserialization retain this same object.
 struct SiriusReadParquetBindData : public FunctionData {
   SiriusReadParquetBindData(
     std::string uri,
@@ -92,40 +109,51 @@ struct SiriusReadParquetBindData : public FunctionData {
 
   SiriusReadParquetBindData(std::vector<SiriusParquetFileBindData> files,
                             std::size_t total_num_rows)
-    : files(std::move(files)), total_num_rows(total_num_rows)
+    : bound_scan(std::make_shared<SiriusParquetBoundScan>(std::move(files), total_num_rows))
   {
-    if (this->files.empty()) { return; }
-    // Compatibility mirrors for existing one-file callers. New consumers use
-    // `files`, which preserves evidence for every input in order.
-    auto const& first = this->files.front();
-    uri               = first.uri;
-    file_metadata     = first.file_metadata;
-    object_size       = first.object_size;
-    validation_etag   = first.validation_etag;
-    local_version     = first.local_version;
   }
 
-  std::vector<SiriusParquetFileBindData> files;
-  std::string uri;
-  std::size_t total_num_rows{0};
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  /// Size observed while reading the bound footer. Reused to open object-store
-  /// data reads without a second size-discovery HEAD request.
-  std::size_t object_size{0};
-  /// Footer Range GET ETag for S3, empty when unavailable.
-  std::string validation_etag;
-  /// Bind-time local size/mtime evidence; unavailable for remote paths.
-  sirius::io::local_file_version local_version;
+  explicit SiriusReadParquetBindData(std::shared_ptr<SiriusParquetBoundScan const> bound_scan)
+    : bound_scan(std::move(bound_scan))
+  {
+  }
+
+  [[nodiscard]] SiriusParquetBoundScan const& scan() const { return *bound_scan; }
+  [[nodiscard]] std::vector<SiriusParquetFileBindData> const& files() const { return scan().files; }
+  [[nodiscard]] std::size_t total_num_rows() const { return scan().total_num_rows; }
+  [[nodiscard]] uint64_t generation() const { return scan().generation; }
+  [[nodiscard]] uint64_t scan_instance_id() const { return scan().scan_instance_id; }
+  [[nodiscard]] uint64_t fingerprint() const { return scan().fingerprint; }
+
+  // One-file accessors preserve the old compatibility surface without making a
+  // second copy of the footer evidence. Callers for multi-file scans use files().
+  [[nodiscard]] std::string const& uri() const { return files().front().uri; }
+  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> const& file_metadata() const
+  {
+    return files().front().file_metadata;
+  }
+  [[nodiscard]] std::size_t object_size() const { return files().front().object_size; }
+  [[nodiscard]] std::string const& validation_etag() const { return files().front().validation_etag; }
+  [[nodiscard]] sirius::io::local_file_version const& local_version() const
+  {
+    return files().front().local_version;
+  }
+
+  std::shared_ptr<SiriusParquetBoundScan const> bound_scan;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(files, total_num_rows);
+    return make_uniq<SiriusReadParquetBindData>(bound_scan);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
-    return files == other.files && total_num_rows == other.total_num_rows;
+    return bound_scan == other.bound_scan ||
+           (scan().generation == other.scan().generation &&
+            scan().scan_instance_id == other.scan().scan_instance_id &&
+            scan().fingerprint == other.scan().fingerprint && files() == other.files() &&
+            total_num_rows() == other.total_num_rows());
   }
 };
 

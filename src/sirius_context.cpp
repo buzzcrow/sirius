@@ -37,6 +37,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan/file_scan_bind_catalog.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -1736,6 +1737,8 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
     // immediately on every normal (transparent) connection instead of just the FFI's own.
     context.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
                                      duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
+    context.registered_state->Insert(sirius::scan::file_scan_bind_catalog::kStateKey,
+                                     duckdb::make_shared_ptr<sirius::scan::file_scan_bind_catalog>());
   }
 }
 
@@ -1746,6 +1749,7 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
   context.registered_state->Remove("sirius_state");
   context.registered_state->Remove("sirius_connection_state");
   context.registered_state->Remove(sirius::exec::stream_bind_catalog::kStateKey);
+  context.registered_state->Remove(sirius::scan::file_scan_bind_catalog::kStateKey);
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)
