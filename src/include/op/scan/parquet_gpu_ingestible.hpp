@@ -18,6 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
+#include <io/file_version.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
@@ -75,6 +76,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// Footer Range GET ETag for S3. Passed to the datasource so every data
   /// range response can be checked against the bound object.
   std::string bound_file_validation_etag;
+  /// Bind-time local size/mtime evidence. The scan compares it against the
+  /// newly opened local file, then releases that descriptor normally.
+  sirius::io::local_file_version bound_file_local_version;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;

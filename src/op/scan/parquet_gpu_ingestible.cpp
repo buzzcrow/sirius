@@ -683,6 +683,17 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
+  if (_info->bound_file_local_version.available) {
+    auto const opened_version = sirius_ds->io_object().local_version();
+    if (!opened_version.available) {
+      SIRIUS_LOG_WARN("[parquet_gpu_ingestible] local file '{}' has no version evidence at scan; "
+                      "falling back to the immutable-file convention",
+                      file_path);
+    } else if (opened_version != _info->bound_file_local_version) {
+      throw std::runtime_error("[parquet_gpu_ingestible] local file version conflict for '" +
+                               file_path + "'");
+    }
+  }
 
   // Local copy of the shared options; the per-file filter pushdown decision is
   // applied here, never on _reader_options.

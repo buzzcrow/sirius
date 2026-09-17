@@ -280,6 +280,8 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
     check_bind_shape_matches_duckdb(bind_info, expected);
     CHECK(bind_info.total_num_rows > 0);
     CHECK(bind_info.object_size > 0);
+    REQUIRE(bind_info.local_version.available);
+    CHECK(bind_info.local_version.size == bind_info.object_size);
   }
 }
 

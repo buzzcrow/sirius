@@ -19,6 +19,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "io/file_version.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -47,12 +48,14 @@ struct SiriusReadParquetBindData : public FunctionData {
                             std::size_t total_num_rows,
                             std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
                             std::size_t object_size = 0,
-                            std::string validation_etag = {})
+                            std::string validation_etag = {},
+                            sirius::io::local_file_version local_version = {})
     : uri(std::move(uri)),
       total_num_rows(total_num_rows),
       file_metadata(std::move(file_metadata)),
       object_size(object_size),
-      validation_etag(std::move(validation_etag))
+      validation_etag(std::move(validation_etag)),
+      local_version(std::move(local_version))
   {
   }
 
@@ -64,11 +67,13 @@ struct SiriusReadParquetBindData : public FunctionData {
   std::size_t object_size{0};
   /// Footer Range GET ETag for S3, empty when unavailable.
   std::string validation_etag;
+  /// Bind-time local size/mtime evidence; unavailable for remote paths.
+  sirius::io::local_file_version local_version;
 
   unique_ptr<FunctionData> Copy() const override
   {
     return make_uniq<SiriusReadParquetBindData>(
-      uri, total_num_rows, file_metadata, object_size, validation_etag);
+      uri, total_num_rows, file_metadata, object_size, validation_etag, local_version);
   }
 
   bool Equals(FunctionData const& other_p) const override
@@ -76,7 +81,7 @@ struct SiriusReadParquetBindData : public FunctionData {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
     return uri == other.uri && total_num_rows == other.total_num_rows &&
            file_metadata == other.file_metadata && object_size == other.object_size &&
-           validation_etag == other.validation_etag;
+           validation_etag == other.validation_etag && local_version == other.local_version;
   }
 };
 

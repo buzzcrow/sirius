@@ -45,14 +45,24 @@ namespace sirius::io {
  */
 class kvikio_io_object final : public sirius_io_object {
  public:
-  kvikio_io_object(std::string path, std::shared_ptr<cudf::io::datasource> ds, size_t file_size)
-    : _path(std::move(path)), _datasource(std::move(ds)), _file_size(file_size)
+  kvikio_io_object(std::string path,
+                   std::shared_ptr<cudf::io::datasource> ds,
+                   size_t file_size,
+                   local_file_version local_version = {})
+    : _path(std::move(path)),
+      _datasource(std::move(ds)),
+      _file_size(file_size),
+      _local_version(std::move(local_version))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
   [[nodiscard]] size_t size() const noexcept final { return _file_size; }
+  [[nodiscard]] local_file_version local_version() const noexcept final
+  {
+    return _local_version;
+  }
 
   [[nodiscard]] cudf::io::datasource& datasource() const noexcept { return *_datasource; }
 
@@ -60,6 +70,7 @@ class kvikio_io_object final : public sirius_io_object {
   std::string _path;
   std::shared_ptr<cudf::io::datasource> _datasource;
   size_t _file_size{0};
+  local_file_version _local_version;
 };
 
 // ---------------------------------------------------------------------------

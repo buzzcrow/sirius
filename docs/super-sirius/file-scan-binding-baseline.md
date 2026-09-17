@@ -36,14 +36,17 @@ execution copies.
    parses `parquet_metadata`, extracts the schema and row count, and returns a
    shared `FileMetaData` object.
 3. `SiriusReadParquetBindData` retains the URI, object size, row count, and
-   that shared footer object. Its cardinality callback exposes the exact footer
+   that shared footer object. For local files it also retains the bind fd's
+   size/mtime_ns evidence; its cardinality callback exposes the exact footer
    row count to DuckDB's optimizer.
 4. `populate_parquet_table_info` consumes the URI and footer from that bind
    object. It does not derive the file identity from `LogicalGet` parameters.
 5. `parquet_gpu_ingestible::build_file_scan_info` receives the bound footer and
    object size. It opens the datasource with the known size, skipping both the
    footer probe and S3's size-discovery HEAD; it also skips the metadata-store
-   fallback. The resulting row-group slices retain the same parsed footer object.
+   fallback. A local scan compares the evidence from its newly opened fd before
+   using the bound footer. The resulting row-group slices retain the same
+   parsed footer object.
 
 The target S3 policy is response-driven: the footer-probe Range GET supplies
 the bind ETag and `Content-Range` supplies the full object size. Every later
@@ -52,11 +55,14 @@ response ETag emits a WARN and falls back to the documented immutable-object
 assumption; a differing ETag is a version conflict, never a reason to refresh
 the footer in place. This comparison has no separate HEAD request. The
 single-file `sirius_read_parquet` path implements this propagation and
-comparison; multi-file binding and cache version isolation remain future work.
+comparison. Local files similarly compare bind and scan size/mtime_ns without
+retaining a fd across that interval; absent scan evidence emits a WARN and
+falls back to the immutable-file convention. Multi-file binding and cache
+version isolation remain future work.
 
 This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
-does not provide version evidence, multi-file binding, serialization, query
-registry ownership, or an Iceberg snapshot binding contract.
+does not provide multi-file binding, serialization, query registry ownership,
+cache version isolation, or an Iceberg snapshot binding contract.
 
 ## Reproduction anchors
 

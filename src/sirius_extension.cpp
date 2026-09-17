@@ -289,7 +289,8 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     bind_result.total_num_rows,
     std::move(bind_result.file_metadata),
     bind_result.object_size,
-    std::move(bind_result.validation_etag));
+    std::move(bind_result.validation_etag),
+    std::move(bind_result.local_version));
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the

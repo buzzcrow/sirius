@@ -16,6 +16,9 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -45,8 +48,16 @@ std::shared_ptr<sirius_io_object> kvikio_context::create_io_object(std::string p
   // ownership (the io_object outlives any single sirius_datasource we hand
   // back from open_datasource).
   std::shared_ptr<cudf::io::datasource> ds = cudf::io::datasource::create(path);
-  auto const file_size                     = ds->size();
-  return std::make_shared<kvikio_io_object>(std::move(path), std::move(ds), file_size);
+  auto const file_size = ds->size();
+  // cuDF owns the local handle here. Reopen its path only for fstat evidence;
+  // this fallback has no descriptor API to expose the already-open handle.
+  local_file_version version;
+  auto const fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    version = local_file_version_from_fd(fd);
+    ::close(fd);
+  }
+  return std::make_shared<kvikio_io_object>(std::move(path), std::move(ds), file_size, version);
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept

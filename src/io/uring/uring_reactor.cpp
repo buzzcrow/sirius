@@ -532,9 +532,13 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: O_DIRECT open failed: " + path +
                              ": " + strerror(errno));
 
-  auto file_size = size(fd.native_handle());
+  auto const local_version = local_file_version_from_fd(fd.native_handle());
+  if (!local_version.available) {
+    throw std::runtime_error("uring_reactor::create_io_object: fstat failed: " + path + ": " +
+                             strerror(errno));
+  }
   return std::make_unique<local_io_object>(
-    std::move(path), std::move(fd), std::move(fd_direct), file_size);
+    std::move(path), std::move(fd), std::move(fd_direct), local_version.size, "", local_version);
 }
 
 size_t uring_reactor::size(int fd)

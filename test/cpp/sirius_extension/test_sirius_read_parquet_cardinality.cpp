@@ -21,6 +21,7 @@ namespace {
 constexpr duckdb::idx_t orders_row_count = 150000;
 constexpr std::size_t orders_object_size  = 42'000'000;
 constexpr char orders_etag[]              = "\"orders-v1\"";
+constexpr sirius::io::local_file_version orders_local_version{true, orders_object_size, 123456789};
 
 struct unrelated_function_data : public duckdb::FunctionData {
   duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
@@ -44,6 +45,7 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   CHECK(bind_data.total_num_rows == orders_row_count);
   CHECK(bind_data.object_size == orders_object_size);
   CHECK(bind_data.validation_etag == orders_etag);
+  CHECK_FALSE(bind_data.local_version.available);
 
   auto copy = bind_data.Copy();
   REQUIRE(copy != nullptr);
@@ -54,6 +56,7 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   CHECK(typed_copy->file_metadata == footer);
   CHECK(typed_copy->object_size == orders_object_size);
   CHECK(typed_copy->validation_etag == orders_etag);
+  CHECK_FALSE(typed_copy->local_version.available);
   CHECK(bind_data.Equals(*copy));
 
   duckdb::SiriusReadParquetBindData different_uri{"s3://bucket/lineitem.parquet", orders_row_count};
@@ -75,6 +78,28 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   duckdb::SiriusReadParquetBindData different_etag{
     "s3://bucket/orders.parquet", orders_row_count, footer, orders_object_size, "\"orders-v2\""};
   CHECK_FALSE(bind_data.Equals(different_etag));
+
+  duckdb::SiriusReadParquetBindData local_bind{"/data/orders.parquet",
+                                                orders_row_count,
+                                                footer,
+                                                orders_object_size,
+                                                {},
+                                                orders_local_version};
+  auto local_copy = local_bind.Copy();
+  REQUIRE(local_copy != nullptr);
+  auto* typed_local_copy = dynamic_cast<duckdb::SiriusReadParquetBindData*>(local_copy.get());
+  REQUIRE(typed_local_copy != nullptr);
+  CHECK(typed_local_copy->local_version == orders_local_version);
+  CHECK(local_bind.Equals(*local_copy));
+
+  duckdb::SiriusReadParquetBindData different_local_version{
+    "/data/orders.parquet",
+    orders_row_count,
+    footer,
+    orders_object_size,
+    {},
+    sirius::io::local_file_version{true, orders_object_size, orders_local_version.mtime_ns + 1}};
+  CHECK_FALSE(local_bind.Equals(different_local_version));
 }
 
 TEST_CASE("SiriusReadParquetCardinality returns exact DuckDB node statistics",

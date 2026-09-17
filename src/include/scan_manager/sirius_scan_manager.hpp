@@ -427,6 +427,9 @@ struct parquet_bind_result {
   /// ETag supplied by the footer probe response for object-store sources.
   /// Empty when the backend has no ETag evidence.
   std::string validation_etag;
+  /// Local file evidence captured from the bind-time fd. Unavailable for
+  /// remote objects and when a backend cannot expose local evidence.
+  sirius::io::local_file_version local_version;
   std::size_t object_size{0};
   std::size_t total_num_rows{0};
 };
