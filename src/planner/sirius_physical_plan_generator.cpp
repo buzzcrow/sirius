@@ -80,7 +80,7 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
   duckdb::FunctionData const* bind_data,
   duckdb::vector<duckdb::Value> const& /*parameters*/)
 {
-  if (function_name == "sirius_read_parquet") {
+  if (function_name == "sirius_read_parquet" || function_name == "sirius_parquet_scan") {
     // The Sirius-owned single-file Parquet function carries its fixed URI in
     // bind data rather than MultiFileBindData. Physical planning must consume
     // that bind result, not re-derive the file identity from LogicalGet parameters.
@@ -158,16 +158,17 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   info->table_filters      = std::move(scan_op.table_filters);
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
-  if (scan_op.function.name == "sirius_read_parquet") {
+  if (scan_op.function.name == "sirius_read_parquet" ||
+      scan_op.function.name == "sirius_parquet_scan") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
-        "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
+        "[sirius_physical_plan_generator::build_parquet_table_info] Sirius-owned Parquet scan "
         "has no URI parameter");
     }
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const* bind = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(scan_op.bind_data.get());
     if (!bind || !bind->file_metadata) {
-      throw std::runtime_error("sirius_read_parquet scan has no bound footer metadata");
+      throw std::runtime_error("Sirius-owned Parquet scan has no bound footer metadata");
     }
     info->bound_file_metadata    = bind->file_metadata;
     info->bound_file_object_size = bind->object_size;
@@ -426,7 +427,8 @@ void wrap_table_scan_source(
                               sirius_ctx.get());
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
+  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet" ||
+             fn == "sirius_parquet_scan") {
     // Parquet applies AST filters in the reader; post-decode uses membership only.
     leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
                               scan,

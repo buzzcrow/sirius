@@ -307,6 +307,15 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
     "read_parquet('s3://...') inside gpu_execution()");
 }
 
+// Explicit Sirius scans are GPU-only. A direct DuckDB execution means the
+// transparent physical-plan replacement did not occur, so fail rather than
+// pretending that this source has a CPU implementation.
+void SiriusParquetScanFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "sirius_parquet_scan is GPU-only; enable Sirius GPU execution for this query");
+}
+
 }  // namespace
 
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
@@ -2485,6 +2494,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   sirius_read_parquet.filter_prune        = true;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
+
+  // Public, GPU-only counterpart of the internal compatibility entry point.
+  // It deliberately has the same narrow single-URI contract today: it enters
+  // the Sirius-owned bind path and carries the resulting footer/evidence to
+  // physical planning. Multi-file/listing options arrive with the shared
+  // Parquet source binder (C1), rather than being accepted and ignored here.
+  TableFunction sirius_parquet_scan("sirius_parquet_scan",
+                                    {LogicalType::VARCHAR},
+                                    SiriusParquetScanFunction,
+                                    SiriusReadParquetBind);
+  sirius_parquet_scan.cardinality         = SiriusReadParquetCardinality;
+  sirius_parquet_scan.projection_pushdown = true;
+  sirius_parquet_scan.filter_pushdown     = true;
+  sirius_parquet_scan.filter_prune        = true;
+  CreateTableFunctionInfo sirius_parquet_scan_info(sirius_parquet_scan);
+  catalog.CreateTableFunction(transaction, sirius_parquet_scan_info);
 
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},

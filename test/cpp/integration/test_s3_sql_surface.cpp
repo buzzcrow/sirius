@@ -1928,21 +1928,24 @@ std::uint64_t tpch_dataset_bytes(fs::path const& root)
 
 }  // namespace
 
-TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
+TEST_CASE("Sirius Parquet table functions are registered as one-argument table functions",
           "[sql][s3][registration]")
 {
   duckdb::DuckDB db(nullptr);
   load_sirius_extension(db);
   duckdb::Connection con(db);
 
-  auto result = require_query_ok(con,
-                                 "SELECT function_name, parameter_types "
-                                 "FROM duckdb_functions() "
-                                 "WHERE function_name = 'sirius_read_parquet' "
-                                 "ORDER BY function_name");
-  REQUIRE(result->RowCount() == 1);
-  CHECK(result->GetValue(0, 0).ToString() == "sirius_read_parquet");
+  auto result = require_query_ok(
+    con,
+    "SELECT function_name, parameter_types "
+    "FROM duckdb_functions() "
+    "WHERE function_name IN ('sirius_read_parquet', 'sirius_parquet_scan') "
+    "ORDER BY function_name");
+  REQUIRE(result->RowCount() == 2);
+  CHECK(result->GetValue(0, 0).ToString() == "sirius_parquet_scan");
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
+  CHECK(result->GetValue(0, 1).ToString() == "sirius_read_parquet");
+  CHECK(result->GetValue(1, 1).ToString().find("VARCHAR") != std::string::npos);
 }
 
 TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
