@@ -707,6 +707,9 @@ class sirius_scan_manager {
     std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
+  /// Bind every supplied Parquet footer with bounded concurrency, preserving
+  /// input order in the returned vector. Any probe failure aborts the bind.
+  std::vector<parquet_bind_result> describe_parquet(std::vector<std::string> const& uris);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager

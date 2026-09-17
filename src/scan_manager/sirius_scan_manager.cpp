@@ -1398,18 +1398,42 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
       std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
   }
 
-  auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
+  auto schema               = sirius::io::parquet_helpers::extract_schema(*file_metadata);
   auto const total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
 
   parquet_bind_result result;
-  result.return_types   = std::move(schema.types);
-  result.names          = std::move(schema.names);
-  result.file_metadata  = std::move(file_metadata);
+  result.return_types    = std::move(schema.types);
+  result.names           = std::move(schema.names);
+  result.file_metadata   = std::move(file_metadata);
   result.validation_etag = std::string(datasource->io_object().validation_etag());
-  result.local_version  = datasource->io_object().local_version();
-  result.object_size    = datasource->size();
-  result.total_num_rows = total_num_rows;
+  result.local_version   = datasource->io_object().local_version();
+  result.object_size     = datasource->size();
+  result.total_num_rows  = total_num_rows;
   return result;
+}
+
+std::vector<parquet_bind_result> sirius_scan_manager::describe_parquet(
+  std::vector<std::string> const& uris)
+{
+  std::vector<parquet_bind_result> results(uris.size());
+  if (uris.empty()) { return results; }
+
+  exec::scoped_dispatcher dispatcher(_thread_pool, _thread_pool.num_threads());
+  std::mutex error_mutex;
+  std::exception_ptr first_error;
+  for (std::size_t i = 0; i < uris.size(); ++i) {
+    dispatcher.enqueue([this, &uris, &results, &error_mutex, &first_error, i] {
+      try {
+        results[i] = describe_parquet(uris[i]);
+      } catch (...) {
+        std::lock_guard lock(error_mutex);
+        if (!first_error) { first_error = std::current_exception(); }
+      }
+    });
+  }
+  dispatcher.wait_for_all();
+  if (first_error) { std::rethrow_exception(first_error); }
+  return results;
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,

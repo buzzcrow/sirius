@@ -322,8 +322,10 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   std::vector<SiriusParquetFileBindData> files;
   files.reserve(uris.size());
   std::size_t total_num_rows = 0;
-  for (auto const& uri : uris) {
-    auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
+  auto bind_results          = sirius_ctx->get_scan_manager().describe_parquet(uris);
+  for (std::size_t i = 0; i < uris.size(); ++i) {
+    auto const& uri  = uris[i];
+    auto bind_result = std::move(bind_results[i]);
     if (files.empty()) {
       return_types = std::move(bind_result.return_types);
       names        = std::move(bind_result.names);
