@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/metadata_store.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
@@ -1486,6 +1487,24 @@ TEST_CASE("rest cache identity includes object version evidence", "[s3][rest][ca
   CHECK(v1.raw_file_cache_id() == same.raw_file_cache_id());
   CHECK(v1.raw_file_cache_id() != v2.raw_file_cache_id());
   CHECK(no_tag_a.raw_file_cache_id() != no_tag_b.raw_file_cache_id());
+}
+
+TEST_CASE("metadata store retires an older version without invalidating its readers",
+          "[s3][rest][cache]")
+{
+  struct metadata final : sirius::io::sirius_io_object_metadata {};
+  using sirius::io::rest::rest_io_object;
+  sirius::io::cache::metadata_store store;
+  rest_io_object v1{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object v2{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v2\""};
+  auto old = std::make_shared<metadata>();
+  store.register_metadata(v1, old);
+  store.register_metadata(v2, std::make_shared<metadata>());
+
+  CHECK(store.size() == 1);
+  CHECK(store.get_metadata(v1) == nullptr);
+  CHECK(store.get_metadata(v2) != nullptr);
+  CHECK(old != nullptr);
 }
 
 TEST_CASE("rest range reads validate a bound ETag without HEAD", "[s3][integration][rest][etag]")
