@@ -260,7 +260,7 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
 // footer through describe_parquet (footer-only, no full-file download), then
 // hands the inferred schema back to DuckDB. Bind data carries the URI and
 // footer row count so the cardinality callback can expose a real estimate to
-// the optimizer; the pipeline converter still reads the URI from parameters[0].
+// the optimizer; physical planning consumes this same bind object.
 unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                                                TableFunctionBindInput& input,
                                                vector<LogicalType>& return_types,
@@ -2465,7 +2465,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 
-  // Sirius-owned S3 parquet entry point. gpu_execution rewrites
+  // Sirius-owned S3 parquet compatibility entry point. gpu_execution rewrites
   // read_parquet('s3://...') to this table function so the bind runs through
   // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
   // Registered so the rewrite's output binds, but INTERNAL — not a public

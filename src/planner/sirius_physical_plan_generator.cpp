@@ -78,13 +78,15 @@ namespace sirius::planner {
 std::vector<std::string> resolve_parquet_scan_file_paths(
   std::string_view function_name,
   duckdb::FunctionData const* bind_data,
-  duckdb::vector<duckdb::Value> const& parameters)
+  duckdb::vector<duckdb::Value> const& /*parameters*/)
 {
   if (function_name == "sirius_read_parquet") {
-    // Internal S3 rewrite target: its bind_data is SiriusReadParquetBindData, not
-    // MultiFileBindData — the resolved URI travels in parameters[0].
-    if (parameters.empty() || parameters.front().IsNull()) { return {}; }
-    return {parameters.front().GetValue<std::string>()};
+    // The Sirius-owned single-file Parquet function carries its fixed URI in
+    // bind data rather than MultiFileBindData. Physical planning must consume
+    // that bind result, not re-derive the file identity from LogicalGet parameters.
+    auto const* bound = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(bind_data);
+    if (bound == nullptr || bound->uri.empty()) { return {}; }
+    return {bound->uri};
   }
   if (function_name == "parquet_scan" || function_name == "read_parquet" ||
       function_name == "iceberg_scan") {

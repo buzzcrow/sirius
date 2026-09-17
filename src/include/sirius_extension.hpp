@@ -38,10 +38,10 @@ class GPUBufferManager;
 struct DBConfig;
 
 // Bind-time payload for the sirius_read_parquet table function. Carries the
-// canonical URI (also passed in parameters[0] — the pipeline converter still
-// reads it from there) plus the parquet's footer row count, so DuckDB's
-// optimizer sees a real cardinality estimate via the registered cardinality
-// callback instead of falling back to "unknown table function output".
+// canonical URI and parquet footer row count. The physical planner consumes
+// this URI and footer directly, while DuckDB's optimizer sees a real
+// cardinality estimate via the registered callback instead of falling back to
+// "unknown table function output".
 struct SiriusReadParquetBindData : public FunctionData {
   SiriusReadParquetBindData(std::string uri,
                             std::size_t total_num_rows,
