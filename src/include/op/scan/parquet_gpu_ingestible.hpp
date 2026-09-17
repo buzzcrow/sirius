@@ -69,6 +69,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   std::vector<std::string> resolved_file_paths;
   /// Metadata fixed at Sirius bind for the single-file Sirius-owned route.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> bound_file_metadata;
+  /// Size observed with @ref bound_file_metadata. Object-store scans pass it
+  /// to the IO backend to avoid a second size-discovery HEAD.
+  std::size_t bound_file_object_size{0};
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;

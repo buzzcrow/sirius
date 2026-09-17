@@ -169,7 +169,8 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     if (!bind || !bind->file_metadata) {
       throw std::runtime_error("sirius_read_parquet scan has no bound footer metadata");
     }
-    info->bound_file_metadata = bind->file_metadata;
+    info->bound_file_metadata    = bind->file_metadata;
+    info->bound_file_object_size = bind->object_size;
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(

@@ -45,25 +45,32 @@ struct DBConfig;
 struct SiriusReadParquetBindData : public FunctionData {
   SiriusReadParquetBindData(std::string uri,
                             std::size_t total_num_rows,
-                            std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr)
-    : uri(std::move(uri)), total_num_rows(total_num_rows), file_metadata(std::move(file_metadata))
+                            std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
+                            std::size_t object_size = 0)
+    : uri(std::move(uri)),
+      total_num_rows(total_num_rows),
+      file_metadata(std::move(file_metadata)),
+      object_size(object_size)
   {
   }
 
   std::string uri;
   std::size_t total_num_rows{0};
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  /// Size observed while reading the bound footer. Reused to open object-store
+  /// data reads without a second size-discovery HEAD request.
+  std::size_t object_size{0};
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, file_metadata);
+    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, file_metadata, object_size);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
     return uri == other.uri && total_num_rows == other.total_num_rows &&
-           file_metadata == other.file_metadata;
+           file_metadata == other.file_metadata && object_size == other.object_size;
   }
 };
 

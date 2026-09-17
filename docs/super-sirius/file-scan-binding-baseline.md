@@ -35,15 +35,15 @@ execution copies.
 2. `describe_parquet` opens a datasource with the footer-probe hint, obtains or
    parses `parquet_metadata`, extracts the schema and row count, and returns a
    shared `FileMetaData` object.
-3. `SiriusReadParquetBindData` retains the URI, row count, and that shared
-   footer object. Its cardinality callback exposes the exact footer row count
-   to DuckDB's optimizer.
+3. `SiriusReadParquetBindData` retains the URI, object size, row count, and
+   that shared footer object. Its cardinality callback exposes the exact footer
+   row count to DuckDB's optimizer.
 4. `populate_parquet_table_info` consumes the URI and footer from that bind
    object. It does not derive the file identity from `LogicalGet` parameters.
-5. `parquet_gpu_ingestible::build_file_scan_info` receives the bound footer.
-   It opens the datasource with the generic hint and skips the footer probe and
-   metadata-store fallback. The resulting row-group slices retain the same
-   parsed footer object.
+5. `parquet_gpu_ingestible::build_file_scan_info` receives the bound footer and
+   object size. It opens the datasource with the known size, skipping both the
+   footer probe and S3's size-discovery HEAD; it also skips the metadata-store
+   fallback. The resulting row-group slices retain the same parsed footer object.
 
 This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
 does not provide version evidence, multi-file binding, serialization, query

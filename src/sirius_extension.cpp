@@ -285,7 +285,10 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
   return make_uniq<SiriusReadParquetBindData>(
-    uri, bind_result.total_num_rows, std::move(bind_result.file_metadata));
+    uri,
+    bind_result.total_num_rows,
+    std::move(bind_result.file_metadata),
+    bind_result.object_size);
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
