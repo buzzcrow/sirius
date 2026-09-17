@@ -171,6 +171,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     }
     info->bound_file_metadata    = bind->file_metadata;
     info->bound_file_object_size = bind->object_size;
+    info->bound_file_validation_etag = bind->validation_etag;
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(

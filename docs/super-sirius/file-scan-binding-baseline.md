@@ -50,9 +50,9 @@ the bind ETag and `Content-Range` supplies the full object size. Every later
 range-read response must compare its ETag with that bound value. A missing
 response ETag emits a WARN and falls back to the documented immutable-object
 assumption; a differing ETag is a version conflict, never a reason to refresh
-the footer in place. This comparison has no separate HEAD request. ETag
-propagation and comparison are not implemented by this initial footer/size
-handoff yet.
+the footer in place. This comparison has no separate HEAD request. The
+single-file `sirius_read_parquet` path implements this propagation and
+comparison; multi-file binding and cache version isolation remain future work.
 
 This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
 does not provide version evidence, multi-file binding, serialization, query

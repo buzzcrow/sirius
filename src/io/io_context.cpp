@@ -95,6 +95,15 @@ std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string pat
                                              create_io_object(strip_file_scheme(path), known_size));
 }
 
+std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
+                                                                 std::uint64_t known_size,
+                                                                 std::string validation_etag)
+{
+  return std::make_unique<sirius_datasource>(
+    shared_from_this(),
+    create_io_object(strip_file_scheme(path), known_size, std::move(validation_etag)));
+}
+
 std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
                                                                  open_hint /*hint*/)
 {
@@ -105,6 +114,13 @@ std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string pat
                                                                  std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));
+}
+
+std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
+                                                                 std::uint64_t known_size,
+                                                                 std::string /*validation_etag*/)
+{
+  return create_io_object(std::move(path), known_size);
 }
 
 }  // namespace sirius::io

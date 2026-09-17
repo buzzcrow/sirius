@@ -107,6 +107,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<sirius_io_object> create_io_object(std::string path,
                                                      std::uint64_t known_size) override;
 
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+                                                     std::uint64_t known_size,
+                                                     std::string validation_etag) override;
+
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's

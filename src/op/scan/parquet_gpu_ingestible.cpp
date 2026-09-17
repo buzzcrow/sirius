@@ -677,7 +677,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // use the footer-probe hint.
   auto const bound_file_metadata = _info->bound_file_metadata;
   std::shared_ptr<io::sirius_datasource> sirius_ds = bound_file_metadata
-    ? io_ctx->open_datasource(file_path, _info->bound_file_object_size)
+    ? io_ctx->open_datasource(
+        file_path, _info->bound_file_object_size, _info->bound_file_validation_etag)
     : io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);

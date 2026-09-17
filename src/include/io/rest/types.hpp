@@ -63,11 +63,13 @@ struct buf_sink {
 struct header_capture {
   std::string content_range;
   std::string retry_after;
+  std::string etag;
 
   void reset() noexcept
   {
     content_range.clear();
     retry_after.clear();
+    etag.clear();
   }
 };
 
@@ -84,6 +86,8 @@ struct rest_chunked_rx_request {
   s3::s3_object_ref object;
   io_object_segment chunk;
   std::size_t file_size{0};
+  /// ETag captured by the bind footer Range GET, empty when unavailable.
+  std::string expected_etag;
   std::size_t attempt{0};       // transient (5xx / curl / short-read) retries
   std::size_t auth_attempt{0};  // bounded HTTP 403 (re-presign) retries
   std::unique_ptr<device_cpy_request> cpy_req;

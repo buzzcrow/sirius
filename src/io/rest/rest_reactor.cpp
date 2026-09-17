@@ -132,16 +132,20 @@ std::string match_header(std::string_view line, std::string_view name)
   return std::string(val);
 }
 
-/// Header callback: capture Content-Range and Retry-After.
+bool is_http_status_line(std::string_view line) noexcept;
+
+/// Header callback: capture Content-Range, Retry-After, and ETag.
 size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* hc           = static_cast<header_capture*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view line(buffer, bytes);
+  if (is_http_status_line(line)) { hc->etag.clear(); }
   if (auto v = match_header(line, "content-range"); !v.empty()) {
     hc->content_range = std::move(v);
   }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
   return bytes;
 }
 
@@ -581,6 +585,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
   auto const obj     = file.object_ref();
+  auto const etag    = std::string(file.validation_etag());
   size_t const fsize = file.size();
   uint8_t* const dst = segment.data();
 
@@ -596,6 +601,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
     req->object                 = obj;
     req->chunk                  = io_object_segment{segment.offset + pos, piece, dst + pos};
     req->file_size              = fsize;
+    req->expected_etag          = etag;
     req->manager                = manager;
     req->perf_blocking_host_get = perf_blocking_host_get;
     chunks.push_back(std::move(req));
@@ -633,6 +639,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
 
   auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
   auto const obj = file.object_ref();
+  auto const etag = std::string(file.validation_etag());
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
@@ -641,6 +648,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
     req->object    = obj;
     req->chunk     = std::move(g);
     req->file_size = fsize;
+    req->expected_etag = etag;
     req->manager   = manager;
     chunks.push_back(std::move(req));
   }
@@ -675,6 +683,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
 
   auto manager   = std::make_shared<request_manager>(wanted, n_win);
   auto const obj = file.object_ref();
+  auto const etag = std::string(file.validation_etag());
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(n_win);
@@ -684,6 +693,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
     req->object     = obj;
     req->chunk      = io_object_segment{w, rs};  // null buffer => reactor stages
     req->file_size  = fsize;
+    req->expected_etag = etag;
     auto cpy        = std::make_unique<device_cpy_request>();
     cpy->stream     = stream;
     cpy->device_id  = device_id;
@@ -718,6 +728,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   size_t const fsize   = file.size();
   size_t const req_end = offset + size;
   auto const obj       = file.object_ref();
+  auto const etag      = std::string(file.validation_etag());
 
   // Validate overlap, total the device-buffer bytes each segment fills (the
   // value reported to the caller — not the host read size, which over-reads to
@@ -787,6 +798,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
     req->object    = obj;
     req->chunk     = std::move(g);
     req->file_size = fsize;
+    req->expected_etag = etag;
     req->cpy_req   = std::move(cpy);
     req->manager   = manager;
     chunks.push_back(std::move(req));
@@ -1570,6 +1582,20 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
             "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
             req.object.bucket + "/" + req.object.key)));
+          return false;
+        }
+      }
+      if (rc == CURLE_OK && ok_range) {
+        if (s.hc.etag.empty()) {
+          SIRIUS_LOG_WARN("rest_reactor: range response has no ETag for {}/{}; "
+                          "falling back to the immutable-object assumption",
+                          req.object.bucket,
+                          req.object.key);
+        } else if (!req.expected_etag.empty() && s.hc.etag != req.expected_etag) {
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+          req.manager->report_error(std::make_exception_ptr(std::runtime_error(
+            "rest_reactor: S3 version conflict for " + req.object.bucket + "/" + req.object.key +
+            " (bind ETag " + req.expected_etag + ", range ETag " + s.hc.etag + ")")));
           return false;
         }
       }

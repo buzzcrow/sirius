@@ -1474,6 +1474,47 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   CHECK(server.get_count() == 1);
 }
 
+TEST_CASE("rest range reads validate a bound ETag without HEAD", "[s3][integration][rest][etag]")
+{
+  auto payload = deterministic_payload(4096);
+
+  SECTION("matching response ETag succeeds")
+  {
+    range_fault_policy fault{};
+    fault.successful_get_etag = "\"v1\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK(datasource->host_read(0, out.size(), out.data()) == out.size());
+    CHECK(out == payload);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("changed response ETag fails as a version conflict")
+  {
+    range_fault_policy fault{};
+    fault.successful_get_etag = "\"v2\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+    std::vector<std::uint8_t> out(payload.size());
+    try {
+      (void)datasource->host_read(0, out.size(), out.data());
+      FAIL("range read should fail when its ETag differs from the bound ETag");
+    } catch (std::runtime_error const& e) {
+      CHECK(std::string{e.what()}.find("S3 version conflict") != std::string::npos);
+    }
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+  }
+}
+
 TEST_CASE("rest footer suffix parses Content-Range totals", "[s3][integration][rest][footerbind]")
 {
   using sirius::io::rest::content_range_total;

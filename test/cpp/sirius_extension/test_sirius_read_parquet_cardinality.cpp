@@ -20,6 +20,7 @@ namespace {
 
 constexpr duckdb::idx_t orders_row_count = 150000;
 constexpr std::size_t orders_object_size  = 42'000'000;
+constexpr char orders_etag[]              = "\"orders-v1\"";
 
 struct unrelated_function_data : public duckdb::FunctionData {
   duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
@@ -37,11 +38,12 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
 {
   auto footer = std::make_shared<cudf::io::parquet::FileMetaData const>();
   duckdb::SiriusReadParquetBindData bind_data{"s3://bucket/orders.parquet", orders_row_count,
-                                             footer, orders_object_size};
+                                             footer, orders_object_size, orders_etag};
 
   CHECK(bind_data.uri == "s3://bucket/orders.parquet");
   CHECK(bind_data.total_num_rows == orders_row_count);
   CHECK(bind_data.object_size == orders_object_size);
+  CHECK(bind_data.validation_etag == orders_etag);
 
   auto copy = bind_data.Copy();
   REQUIRE(copy != nullptr);
@@ -51,6 +53,7 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   CHECK(typed_copy->total_num_rows == bind_data.total_num_rows);
   CHECK(typed_copy->file_metadata == footer);
   CHECK(typed_copy->object_size == orders_object_size);
+  CHECK(typed_copy->validation_etag == orders_etag);
   CHECK(bind_data.Equals(*copy));
 
   duckdb::SiriusReadParquetBindData different_uri{"s3://bucket/lineitem.parquet", orders_row_count};
@@ -62,12 +65,16 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
 
   duckdb::SiriusReadParquetBindData different_footer{
     "s3://bucket/orders.parquet", orders_row_count,
-    std::make_shared<cudf::io::parquet::FileMetaData const>(), orders_object_size};
+    std::make_shared<cudf::io::parquet::FileMetaData const>(), orders_object_size, orders_etag};
   CHECK_FALSE(bind_data.Equals(different_footer));
 
   duckdb::SiriusReadParquetBindData different_size{
     "s3://bucket/orders.parquet", orders_row_count, footer, orders_object_size + 1};
   CHECK_FALSE(bind_data.Equals(different_size));
+
+  duckdb::SiriusReadParquetBindData different_etag{
+    "s3://bucket/orders.parquet", orders_row_count, footer, orders_object_size, "\"orders-v2\""};
+  CHECK_FALSE(bind_data.Equals(different_etag));
 }
 
 TEST_CASE("SiriusReadParquetCardinality returns exact DuckDB node statistics",

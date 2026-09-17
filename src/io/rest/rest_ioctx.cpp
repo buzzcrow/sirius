@@ -18,6 +18,7 @@
 
 #include "io/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -196,6 +197,22 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
                                           static_cast<size_t>(known_size));
 }
 
+std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
+                                                               std::uint64_t known_size,
+                                                               std::string validation_etag)
+{
+  auto parsed = sirius::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  return std::make_shared<rest_io_object>(std::move(path),
+                                          std::move(parsed.host),
+                                          std::move(parsed.path),
+                                          static_cast<size_t>(known_size),
+                                          std::move(validation_etag));
+}
+
 std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);
@@ -218,6 +235,12 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
                                             std::move(parsed.path),
                                             head.object_size,
                                             std::move(head.etag));
+  }
+  if (probe.etag.empty()) {
+    SIRIUS_LOG_WARN("rest_ioctx: footer Range GET has no ETag for s3://{}/{}; "
+                    "falling back to the immutable-object assumption",
+                    parsed.host,
+                    parsed.path);
   }
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),

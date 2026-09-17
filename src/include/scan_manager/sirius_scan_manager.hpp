@@ -424,6 +424,9 @@ struct parquet_bind_result {
   duckdb::vector<duckdb::LogicalType> return_types;
   duckdb::vector<std::string> names;
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  /// ETag supplied by the footer probe response for object-store sources.
+  /// Empty when the backend has no ETag evidence.
+  std::string validation_etag;
   std::size_t object_size{0};
   std::size_t total_num_rows{0};
 };

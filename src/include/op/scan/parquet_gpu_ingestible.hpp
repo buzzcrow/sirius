@@ -72,6 +72,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// Size observed with @ref bound_file_metadata. Object-store scans pass it
   /// to the IO backend to avoid a second size-discovery HEAD.
   std::size_t bound_file_object_size{0};
+  /// Footer Range GET ETag for S3. Passed to the datasource so every data
+  /// range response can be checked against the bound object.
+  std::string bound_file_validation_etag;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;

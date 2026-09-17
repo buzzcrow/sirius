@@ -46,11 +46,13 @@ struct SiriusReadParquetBindData : public FunctionData {
   SiriusReadParquetBindData(std::string uri,
                             std::size_t total_num_rows,
                             std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
-                            std::size_t object_size = 0)
+                            std::size_t object_size = 0,
+                            std::string validation_etag = {})
     : uri(std::move(uri)),
       total_num_rows(total_num_rows),
       file_metadata(std::move(file_metadata)),
-      object_size(object_size)
+      object_size(object_size),
+      validation_etag(std::move(validation_etag))
   {
   }
 
@@ -60,17 +62,21 @@ struct SiriusReadParquetBindData : public FunctionData {
   /// Size observed while reading the bound footer. Reused to open object-store
   /// data reads without a second size-discovery HEAD request.
   std::size_t object_size{0};
+  /// Footer Range GET ETag for S3, empty when unavailable.
+  std::string validation_etag;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, file_metadata, object_size);
+    return make_uniq<SiriusReadParquetBindData>(
+      uri, total_num_rows, file_metadata, object_size, validation_etag);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
     return uri == other.uri && total_num_rows == other.total_num_rows &&
-           file_metadata == other.file_metadata && object_size == other.object_size;
+           file_metadata == other.file_metadata && object_size == other.object_size &&
+           validation_etag == other.validation_etag;
   }
 };
 
