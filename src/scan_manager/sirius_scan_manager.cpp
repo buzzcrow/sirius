@@ -38,6 +38,7 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -1401,10 +1402,117 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto schema               = sirius::io::parquet_helpers::extract_schema(*file_metadata);
   auto const total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
 
+  // Keep the small, optimizer-safe facts separate from the parsed cuDF footer.
+  // The latter is execution evidence and stays attached to the bound scan; no
+  // optimizer callback may need to parse it (or, worse, issue another read).
+  auto footer_summary = std::make_shared<sirius::scan::parquet_footer_summary>();
+  footer_summary->names.assign(schema.names.begin(), schema.names.end());
+  footer_summary->types.assign(schema.types.begin(), schema.types.end());
+  footer_summary->total_num_rows = static_cast<std::uint64_t>(total_num_rows);
+  footer_summary->row_groups.reserve(file_metadata->row_groups.size());
+  std::uint64_t first_row = 0;
+  for (auto const& row_group : file_metadata->row_groups) {
+    auto const row_count = static_cast<std::uint64_t>(row_group.num_rows);
+    if (row_count > std::numeric_limits<std::uint64_t>::max() - first_row) {
+      throw std::runtime_error("[sirius_scan_manager::describe_parquet] row-group row count overflow");
+    }
+    std::uint64_t compressed_bytes   = 0;
+    std::uint64_t uncompressed_bytes = 0;
+    for (auto const& chunk : row_group.columns) {
+      auto const compressed = static_cast<std::uint64_t>(chunk.meta_data.total_compressed_size);
+      auto const uncompressed = static_cast<std::uint64_t>(chunk.meta_data.total_uncompressed_size);
+      if (compressed > std::numeric_limits<std::uint64_t>::max() - compressed_bytes ||
+          uncompressed > std::numeric_limits<std::uint64_t>::max() - uncompressed_bytes) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::describe_parquet] row-group byte count overflow");
+      }
+      compressed_bytes += compressed;
+      uncompressed_bytes += uncompressed;
+    }
+    footer_summary->row_groups.push_back(
+      {first_row, row_count, compressed_bytes, uncompressed_bytes});
+    first_row += row_count;
+  }
+
+  // A footer null count is usable as a top-level SQL null statistic only for
+  // one-leaf, non-nested columns. A nested leaf's count describes repetition
+  // or child validity, not the enclosing value's SQL nullness.
+  footer_summary->column_null_counts.resize(footer_summary->names.size());
+  footer_summary->column_minmax.resize(footer_summary->names.size());
+  for (std::size_t column_index = 0; column_index < footer_summary->names.size(); ++column_index) {
+    auto& null_summary = footer_summary->column_null_counts[column_index];
+    auto& minmax       = footer_summary->column_minmax[column_index];
+    auto const leaves = sirius::op::scan::detail::leaf_indices_for_column(
+      *file_metadata, footer_summary->names[column_index]);
+    if (footer_summary->types[column_index].IsNested() || leaves.size() != 1) { continue; }
+    auto const leaf_index = leaves.front();
+    bool null_complete    = true;
+    bool minmax_complete  = true;
+    std::uint64_t null_count = 0;
+    auto const type_id = footer_summary->types[column_index].id();
+    auto const minmax_supported = type_id == duckdb::LogicalTypeId::BOOLEAN ||
+                                  type_id == duckdb::LogicalTypeId::TINYINT ||
+                                  type_id == duckdb::LogicalTypeId::SMALLINT ||
+                                  type_id == duckdb::LogicalTypeId::INTEGER ||
+                                  type_id == duckdb::LogicalTypeId::BIGINT ||
+                                  type_id == duckdb::LogicalTypeId::UTINYINT ||
+                                  type_id == duckdb::LogicalTypeId::USMALLINT ||
+                                  type_id == duckdb::LogicalTypeId::UINTEGER ||
+                                  type_id == duckdb::LogicalTypeId::UBIGINT;
+    auto const expected_size = type_id == duckdb::LogicalTypeId::BOOLEAN ? 1U :
+                               (type_id == duckdb::LogicalTypeId::BIGINT ||
+                                type_id == duckdb::LogicalTypeId::UBIGINT)
+                                 ? 8U
+                                 : 4U;
+    auto const expected_physical = type_id == duckdb::LogicalTypeId::BOOLEAN
+                                     ? cudf::io::parquet::Type::BOOLEAN
+                                     : (expected_size == 8U ? cudf::io::parquet::Type::INT64
+                                                            : cudf::io::parquet::Type::INT32);
+    for (auto const& row_group : file_metadata->row_groups) {
+      if (leaf_index >= row_group.columns.size()) {
+        null_complete = false;
+        minmax_complete = false;
+        break;
+      }
+      auto const& chunk = row_group.columns[leaf_index];
+      auto const& path  = chunk.meta_data.path_in_schema;
+      auto const& stats = chunk.meta_data.statistics;
+      if (path.size() != 1 || path.front() != footer_summary->names[column_index] ||
+          !stats.null_count.has_value()) {
+        null_complete = false;
+      } else {
+        auto const chunk_null_count = static_cast<std::uint64_t>(*stats.null_count);
+        if (chunk_null_count > std::numeric_limits<std::uint64_t>::max() - null_count) {
+          null_complete = false;
+        } else {
+          null_count += chunk_null_count;
+        }
+      }
+      if (!minmax_supported || chunk.meta_data.type != expected_physical || !stats.min_value ||
+          !stats.max_value || !stats.is_min_value_exact || !*stats.is_min_value_exact ||
+          !stats.is_max_value_exact || !*stats.is_max_value_exact ||
+          stats.min_value->size() != expected_size || stats.max_value->size() != expected_size) {
+        minmax_complete = false;
+      } else {
+        minmax.min_values.push_back(*stats.min_value);
+        minmax.max_values.push_back(*stats.max_value);
+      }
+    }
+    null_summary.complete   = null_complete;
+    null_summary.null_count = null_complete ? null_count : 0;
+    minmax.complete = minmax_complete && minmax.min_values.size() == file_metadata->row_groups.size() &&
+                      minmax.max_values.size() == file_metadata->row_groups.size();
+    if (!minmax.complete) {
+      minmax.min_values.clear();
+      minmax.max_values.clear();
+    }
+  }
+
   parquet_bind_result result;
   result.return_types    = std::move(schema.types);
   result.names           = std::move(schema.names);
   result.file_metadata   = std::move(file_metadata);
+  result.footer_summary  = std::move(footer_summary);
   result.validation_etag = std::string(datasource->io_object().validation_etag());
   result.local_version   = datasource->io_object().local_version();
   result.object_size     = datasource->size();

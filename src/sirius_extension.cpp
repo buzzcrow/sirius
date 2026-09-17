@@ -21,6 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -38,6 +39,8 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <cstring>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -345,7 +348,8 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                      std::move(bind_result.file_metadata),
                      bind_result.object_size,
                      std::move(bind_result.validation_etag),
-                     std::move(bind_result.local_version)});
+                     std::move(bind_result.local_version),
+                     std::move(bind_result.footer_summary)});
   }
   auto conn_state = get_sirius_connection_state(context);
   if (!conn_state) {
@@ -412,6 +416,108 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
   return make_uniq<NodeStatistics>(typed->total_num_rows(), typed->total_num_rows());
+}
+
+namespace {
+
+template <class T>
+std::optional<T> parquet_stat_scalar(std::vector<std::uint8_t> const& bytes)
+{
+  if (bytes.size() != sizeof(T)) { return std::nullopt; }
+  T value;
+  std::memcpy(&value, bytes.data(), sizeof(T));
+  return value;
+}
+
+std::optional<Value> decode_exact_parquet_stat(std::vector<std::uint8_t> const& bytes,
+                                                LogicalType const& type)
+{
+  switch (type.id()) {
+    case LogicalTypeId::BOOLEAN:
+      if (bytes.size() != 1 || (bytes[0] != 0 && bytes[0] != 1)) { return std::nullopt; }
+      return Value::BOOLEAN(bytes[0] != 0);
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER: {
+      auto const raw = parquet_stat_scalar<std::int32_t>(bytes);
+      return raw ? std::optional<Value>{Value::INTEGER(*raw).DefaultCastAs(type)} : std::nullopt;
+    }
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER: {
+      auto const raw = parquet_stat_scalar<std::uint32_t>(bytes);
+      return raw ? std::optional<Value>{Value::UINTEGER(*raw).DefaultCastAs(type)} : std::nullopt;
+    }
+    case LogicalTypeId::BIGINT: {
+      auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+      return raw ? std::optional<Value>{Value::BIGINT(*raw)} : std::nullopt;
+    }
+    case LogicalTypeId::UBIGINT: {
+      auto const raw = parquet_stat_scalar<std::uint64_t>(bytes);
+      return raw ? std::optional<Value>{Value::UBIGINT(*raw)} : std::nullopt;
+    }
+    default: return std::nullopt;
+  }
+}
+
+}  // namespace
+
+unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext&,
+                                                        FunctionData const* bind_data_p,
+                                                        column_t column_index)
+{
+  auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr || typed->files().empty()) { return nullptr; }
+  auto const& first_summary = typed->files().front().footer_summary;
+  if (!first_summary || column_index >= first_summary->types.size()) { return nullptr; }
+
+  bool all_null_free = true;
+  for (auto const& file : typed->files()) {
+    auto const& summary = file.footer_summary;
+    if (!summary || column_index >= summary->column_null_counts.size() ||
+        !summary->column_null_counts[column_index].complete ||
+        summary->column_null_counts[column_index].null_count != 0) {
+      all_null_free = false;
+      break;
+    }
+  }
+  std::optional<Value> minimum;
+  std::optional<Value> maximum;
+  for (auto const& file : typed->files()) {
+    if (column_index >= file.footer_summary->column_minmax.size()) {
+      minimum.reset();
+      maximum.reset();
+      break;
+    }
+    auto const& minmax = file.footer_summary->column_minmax[column_index];
+    if (!minmax.complete || minmax.min_values.size() != minmax.max_values.size()) {
+      minimum.reset();
+      maximum.reset();
+      break;
+    }
+    for (std::size_t i = 0; i < minmax.min_values.size(); ++i) {
+      auto min = decode_exact_parquet_stat(minmax.min_values[i], first_summary->types[column_index]);
+      auto max = decode_exact_parquet_stat(minmax.max_values[i], first_summary->types[column_index]);
+      if (!min || !max || ValueOperations::LessThan(*max, *min)) {
+        minimum.reset();
+        maximum.reset();
+        break;
+      }
+      if (!minimum || ValueOperations::LessThan(*min, *minimum)) { minimum = std::move(min); }
+      if (!maximum || ValueOperations::LessThan(*maximum, *max)) { maximum = std::move(max); }
+    }
+    if (!minimum || !maximum) { break; }
+  }
+
+  if (!all_null_free && (!minimum || !maximum)) { return nullptr; }
+
+  auto result = NumericStats::CreateUnknown(first_summary->types[column_index]);
+  if (all_null_free) { result.Set(StatsInfo::CANNOT_HAVE_NULL_VALUES); }
+  if (minimum && maximum) {
+    NumericStats::SetMin(result, *minimum);
+    NumericStats::SetMax(result, *maximum);
+  }
+  return result.ToUnique();
 }
 
 struct SiriusTableFunctionData : public TableFunctionData {
@@ -2576,6 +2682,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
   sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.statistics          = SiriusReadParquetStatistics;
   sirius_read_parquet.SetSerializeCallback(SiriusReadParquetSerialize);
   sirius_read_parquet.SetDeserializeCallback(SiriusReadParquetDeserialize);
   sirius_read_parquet.projection_pushdown = true;
@@ -2594,6 +2701,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                       SiriusParquetScanFunction,
                                       SiriusReadParquetBind);
     sirius_parquet_scan.cardinality         = SiriusReadParquetCardinality;
+    sirius_parquet_scan.statistics          = SiriusReadParquetStatistics;
     sirius_parquet_scan.SetSerializeCallback(SiriusReadParquetSerialize);
     sirius_parquet_scan.SetDeserializeCallback(SiriusReadParquetDeserialize);
     sirius_parquet_scan.projection_pushdown = true;

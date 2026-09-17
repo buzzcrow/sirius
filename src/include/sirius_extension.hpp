@@ -20,6 +20,7 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "io/file_version.hpp"
+#include "scan/parquet_footer_summary.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -47,12 +48,14 @@ struct SiriusParquetFileBindData {
                             std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                             std::size_t object_size,
                             std::string validation_etag,
-                            sirius::io::local_file_version local_version)
+                            sirius::io::local_file_version local_version,
+                            std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary = nullptr)
     : uri(std::move(uri)),
       file_metadata(std::move(file_metadata)),
       object_size(object_size),
       validation_etag(std::move(validation_etag)),
-      local_version(std::move(local_version))
+      local_version(std::move(local_version)),
+      footer_summary(std::move(footer_summary))
   {
   }
 
@@ -61,12 +64,13 @@ struct SiriusParquetFileBindData {
   std::size_t object_size{0};
   std::string validation_etag;
   sirius::io::local_file_version local_version;
+  std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary;
 
   bool operator==(SiriusParquetFileBindData const& other) const
   {
     return uri == other.uri && file_metadata == other.file_metadata &&
            object_size == other.object_size && validation_etag == other.validation_etag &&
-           local_version == other.local_version;
+           local_version == other.local_version && footer_summary == other.footer_summary;
   }
 };
 
@@ -97,12 +101,14 @@ struct SiriusReadParquetBindData : public FunctionData {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
     std::size_t object_size                                              = 0,
     std::string validation_etag                                          = {},
-    sirius::io::local_file_version local_version                         = {})
+    sirius::io::local_file_version local_version                         = {},
+    std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary = nullptr)
     : SiriusReadParquetBindData(std::vector<SiriusParquetFileBindData>{{std::move(uri),
                                                                         std::move(file_metadata),
                                                                         object_size,
                                                                         std::move(validation_etag),
-                                                                        std::move(local_version)}},
+                                                                        std::move(local_version),
+                                                                        std::move(footer_summary)}},
                                 total_num_rows)
   {
   }
@@ -163,6 +169,13 @@ struct SiriusReadParquetBindData : public FunctionData {
 // default behavior.
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext& context,
                                                         FunctionData const* bind_data);
+
+/// Return only footer statistics whose coverage is complete across every
+/// bound file. Currently this is exact null-free evidence for flat scalar
+/// columns; min/max requires lossless conversion for every Parquet encoding.
+unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext& context,
+                                                        FunctionData const* bind_data,
+                                                        column_t column_index);
 
 class SiriusExtension : public Extension {
  public:

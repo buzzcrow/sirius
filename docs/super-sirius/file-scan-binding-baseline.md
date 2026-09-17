@@ -34,11 +34,20 @@ execution copies.
    `sirius_scan_manager::describe_parquet`.
 2. `describe_parquet` opens a datasource with the footer-probe hint, obtains or
    parses `parquet_metadata`, extracts the schema and row count, and returns a
-   shared `FileMetaData` object.
+   shared `FileMetaData` object plus an immutable scalar footer summary. The
+   summary contains output schema, each row group's original row interval and
+   compressed/uncompressed byte totals, complete scalar null-count evidence,
+   and exact PLAIN bounds for the conservative BOOLEAN/integer subset; it
+   never requires an optimizer callback to parse the footer.
 3. `SiriusParquetBoundScan` retains the ordered URI list, object sizes, total
    row count, shared footer objects and per-file ETag/local size+mtime_ns
-   evidence. Its bind-data wrapper and cardinality callback expose the exact
-   total footer row count to DuckDB's optimizer.
+   evidence. Its bind-data wrapper exposes the exact total footer row count to
+   DuckDB's optimizer. Its statistics callback reports `NOT NULL` only when
+   every bound file has complete scalar null-count coverage proving zero nulls.
+   It also publishes min/max only for fully covered, exact BOOLEAN/integer
+   PLAIN statistics with a lossless DuckDB conversion; decimal, temporal,
+   floating-point, binary and nested values remain unavailable rather than
+   guessed.
 4. `populate_parquet_table_info` consumes the URI and footer from that bind
    object. It does not derive the file identity from `LogicalGet` parameters.
 5. `parquet_gpu_ingestible::build_file_scan_info` receives the bound footer and
@@ -54,8 +63,8 @@ range-read response must compare its ETag with that bound value. A missing
 response ETag emits a WARN and falls back to the documented immutable-object
 assumption; a differing ETag is a version conflict, never a reason to refresh
 the footer in place. This comparison has no separate HEAD request. The
-single-file `sirius_read_parquet` path implements this propagation and
-comparison. Local files similarly compare bind and scan size/mtime_ns without
+Sirius-owned Parquet path implements this propagation and comparison for every
+bound file independently. Local files similarly compare bind and scan size/mtime_ns without
 retaining a fd across that interval; absent scan evidence emits a WARN and
 falls back to the immutable-file convention. Multi-file binding and cache
 version isolation remain future work.

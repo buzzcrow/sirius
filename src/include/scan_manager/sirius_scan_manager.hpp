@@ -34,6 +34,7 @@
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "scan/parquet_footer_summary.hpp"
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
@@ -424,6 +425,9 @@ struct parquet_bind_result {
   duckdb::vector<duckdb::LogicalType> return_types;
   duckdb::vector<std::string> names;
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  /// Scalar facts extracted from @c file_metadata while binding. Consumers
+  /// must use this rather than parsing or fetching a footer again.
+  std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary;
   /// ETag supplied by the footer probe response for object-store sources.
   /// Empty when the backend has no ETag evidence.
   std::string validation_etag;
