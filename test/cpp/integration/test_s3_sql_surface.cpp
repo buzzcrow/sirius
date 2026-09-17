@@ -3902,6 +3902,11 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   REQUIRE(typed != nullptr);
   CHECK(typed->uri == uri);
   CHECK(typed->total_num_rows == expected_orders_rows);
+  REQUIRE(typed->file_metadata != nullptr);
+  auto copied_bind_data = bind_data->Copy();
+  auto const* copied = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(copied_bind_data.get());
+  REQUIRE(copied != nullptr);
+  CHECK(copied->file_metadata == typed->file_metadata);
   CHECK_FALSE(return_types.empty());
   CHECK_FALSE(names.empty());
   REQUIRE(table_function.cardinality != nullptr);

@@ -284,7 +284,8 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+  return make_uniq<SiriusReadParquetBindData>(
+    uri, bind_result.total_num_rows, std::move(bind_result.file_metadata));
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the

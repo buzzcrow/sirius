@@ -52,6 +52,10 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
 
+namespace cudf::io::parquet {
+struct FileMetaData;
+}
+
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
@@ -419,6 +423,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
 struct parquet_bind_result {
   duckdb::vector<duckdb::LogicalType> return_types;
   duckdb::vector<std::string> names;
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   std::size_t object_size{0};
   std::size_t total_num_rows{0};
 };

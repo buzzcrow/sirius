@@ -1405,12 +1405,14 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   }
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
+  auto const total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
 
   parquet_bind_result result;
   result.return_types   = std::move(schema.types);
   result.names          = std::move(schema.names);
+  result.file_metadata  = std::move(file_metadata);
   result.object_size    = datasource->size();
-  result.total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
+  result.total_num_rows = total_num_rows;
   return result;
 }
 

@@ -8,11 +8,13 @@
 #include "catch.hpp"
 #include "sirius_extension.hpp"
 
+#include <cudf/io/parquet_schema.hpp>
 #include <duckdb.hpp>
 #include <duckdb/function/function.hpp>
 #include <duckdb/storage/statistics/node_statistics.hpp>
 
 #include <string>
+#include <memory>
 
 namespace {
 
@@ -32,7 +34,9 @@ struct unrelated_function_data : public duckdb::FunctionData {
 TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadata",
           "[planner-metadata][sirius_read_parquet]")
 {
-  duckdb::SiriusReadParquetBindData bind_data{"s3://bucket/orders.parquet", orders_row_count};
+  auto footer = std::make_shared<cudf::io::parquet::FileMetaData const>();
+  duckdb::SiriusReadParquetBindData bind_data{"s3://bucket/orders.parquet", orders_row_count,
+                                             footer};
 
   CHECK(bind_data.uri == "s3://bucket/orders.parquet");
   CHECK(bind_data.total_num_rows == orders_row_count);
@@ -43,6 +47,7 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   REQUIRE(typed_copy != nullptr);
   CHECK(typed_copy->uri == bind_data.uri);
   CHECK(typed_copy->total_num_rows == bind_data.total_num_rows);
+  CHECK(typed_copy->file_metadata == footer);
   CHECK(bind_data.Equals(*copy));
 
   duckdb::SiriusReadParquetBindData different_uri{"s3://bucket/lineitem.parquet", orders_row_count};
@@ -51,6 +56,11 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
   duckdb::SiriusReadParquetBindData different_rows{"s3://bucket/orders.parquet",
                                                    orders_row_count + 1};
   CHECK_FALSE(bind_data.Equals(different_rows));
+
+  duckdb::SiriusReadParquetBindData different_footer{
+    "s3://bucket/orders.parquet", orders_row_count,
+    std::make_shared<cudf::io::parquet::FileMetaData const>()};
+  CHECK_FALSE(bind_data.Equals(different_footer));
 }
 
 TEST_CASE("SiriusReadParquetCardinality returns exact DuckDB node statistics",

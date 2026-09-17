@@ -351,6 +351,7 @@ TEST_CASE("describe_parquet parks parsed parquet metadata in the rest metadata s
     std::dynamic_pointer_cast<sirius::op::scan::parquet_metadata>(std::move(metadata));
   REQUIRE(parquet_metadata != nullptr);
   REQUIRE(parquet_metadata->file_metadata() != nullptr);
+  CHECK(result.file_metadata == parquet_metadata->file_metadata());
   CHECK(static_cast<std::size_t>(parquet_metadata->file_metadata()->num_rows) ==
         result.total_num_rows);
   CHECK(result.total_num_rows == 25);
@@ -377,6 +378,7 @@ TEST_CASE("describe_parquet reuses the metadata store on repeated S3 binds",
   auto warm               = describe_with_counter(manager, uri, warm_gets);
   CHECK(warm_gets == 0);
   require_same_bind_result(cold, warm);
+  CHECK(cold.file_metadata == warm.file_metadata);
 }
 
 TEST_CASE("describe_parquet footer fetch stays bounded for small and larger S3 parquet objects",

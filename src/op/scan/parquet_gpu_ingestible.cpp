@@ -485,6 +485,10 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   : _info(std::move(info))
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
+  if (bind.bound_file_metadata && bind.resolved_file_paths.size() != 1) {
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] single-file bound metadata requires exactly one input file");
+  }
 
   // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
@@ -667,14 +671,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 {
   auto stream = cudf::get_default_stream();
 
-  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
-  // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
-  // to one suffix-range GET that resolves the size and stashes the footer, so
-  // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
-  // GETs). Fall back to a plain cudf datasource only for local paths no sirius
-  // backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds =
-    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+  // Resolve the file to a sirius_datasource. A Sirius-bound footer is already
+  // fixed for this scan, so use the generic open hint and skip the S3 footer
+  // probe. DuckDB-bound scans still use the footer-probe hint.
+  auto const bound_file_metadata = _info->bound_file_metadata;
+  std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(
+    file_path,
+    bound_file_metadata ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
@@ -685,8 +688,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  if (sirius_ds) {
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = bound_file_metadata;
+  if (!file_metadata && sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();

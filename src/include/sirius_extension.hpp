@@ -21,12 +21,17 @@
 #include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <utility>
 
 namespace sirius {
 struct sirius_config;
 }  // namespace sirius
+
+namespace cudf::io::parquet {
+struct FileMetaData;
+}
 
 namespace duckdb {
 class GPUBufferManager;
@@ -38,23 +43,27 @@ struct DBConfig;
 // optimizer sees a real cardinality estimate via the registered cardinality
 // callback instead of falling back to "unknown table function output".
 struct SiriusReadParquetBindData : public FunctionData {
-  SiriusReadParquetBindData(std::string uri, std::size_t total_num_rows)
-    : uri(std::move(uri)), total_num_rows(total_num_rows)
+  SiriusReadParquetBindData(std::string uri,
+                            std::size_t total_num_rows,
+                            std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr)
+    : uri(std::move(uri)), total_num_rows(total_num_rows), file_metadata(std::move(file_metadata))
   {
   }
 
   std::string uri;
   std::size_t total_num_rows{0};
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows);
+    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, file_metadata);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
-    return uri == other.uri && total_num_rows == other.total_num_rows;
+    return uri == other.uri && total_num_rows == other.total_num_rows &&
+           file_metadata == other.file_metadata;
   }
 };
 

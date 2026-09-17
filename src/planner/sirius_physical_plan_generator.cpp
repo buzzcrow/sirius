@@ -59,6 +59,7 @@
 #include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "sirius_extension.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
@@ -162,6 +163,11 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
         "has no URI parameter");
     }
     info->resolved_file_paths = std::move(resolved_file_paths);
+    auto const* bind = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(scan_op.bind_data.get());
+    if (!bind || !bind->file_metadata) {
+      throw std::runtime_error("sirius_read_parquet scan has no bound footer metadata");
+    }
+    info->bound_file_metadata = bind->file_metadata;
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
