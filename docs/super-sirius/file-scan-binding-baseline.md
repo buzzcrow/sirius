@@ -86,6 +86,141 @@ again parses/binds/optimizes the cached SQL before Sirius physical planning.
 prepared statement. These are the precise seams where `BoundScan` must replace
 path-based rediscovery.
 
+## A2 BoundScan interface contract
+
+`BoundScan` is the immutable, generation-local result of a Sirius source bind.
+It is not a cache key, a path lookup, or a serialized copy of file metadata.
+The source binder creates it only after fixing the read view and reading all
+metadata required for its selected files.  Every plan copy and every physical
+consumer for that bind refers to the same object.
+
+| Contract field | Meaning and ownership |
+| --- | --- |
+| `scan_instance_id` | A fresh opaque ID for one logical file-source occurrence. It distinguishes the two sides of a self-join even when their source locators are equal. It is never derived from a path, function name, or traversal order. |
+| `generation` | The execution-generation ID that owns this binding. A new prepared-statement execution creates a new generation and may bind a new view; copies within one execution retain this value. |
+| source identity | The source adapter's canonical locator and resolved source identity (for example, a Parquet URI/listing identity or Iceberg table UUID plus metadata location). This identifies what was bound; it is not used to find a newer binding. |
+| read view | The immutable source-specific view selected by bind: expanded Parquet file order and options, or Iceberg snapshot/schema/manifest view. The common model holds an adapter-owned payload rather than source-specific fields. |
+| output contract | Bound output names, logical types, ordinal order, and stable field references. A field reference is adapter-defined: Parquet may use a physical-column mapping while Iceberg uses field IDs in its payload. |
+| semantic options | Canonicalized options that affect data meaning, schema construction, partition interpretation, or scan behavior. Presentation-only or execution-only settings do not mutate a bound scan. |
+| file plans | One immutable `FilePlan` per selected input file. The `BoundScan` owns these plans and their `shared_ptr` parsed metadata; metadata-store entries are merely reusable backing cache entries. |
+| object evidence | Per-file version evidence and its strength, such as S3 ETag/size or local size/mtime_ns. Missing evidence explicitly records the immutable-object convention; it must not become a path-only cross-generation cache hit. |
+| optimizer summary | Bind-derived cardinality/statistics values with `exact`, `estimate`, or `unknown` provenance and coverage. Optimizer callbacks only read this snapshot. |
+| format payload | An immutable adapter payload containing format details not valid for every source: Parquet physical schema/mappings, or Iceberg manifest/delete/snapshot data. No Iceberg-only member belongs in the common structure. |
+
+`FilePlan` is the per-file half of this contract. It has a canonical file
+identity, its bound version evidence, parsed footer/format metadata, physical
+column mapping, row-group layout, and any adapter-owned delete information.
+Its row-group slices preserve original file row offsets even when pruning later
+selects only a subset. A later A3 contract will make the exact correspondence
+to `scan_plan.hpp` and `parquet_split_info` executable.
+
+### Lifetime, consumers, and invalidation
+
+The query execution state owns a registry keyed by `(generation,
+scan_instance_id)` whose value is `shared_ptr<const BoundScan>`. A physical
+table-scan consumer additionally owns an immutable consumption contract:
+consumer ID, optimized projection, static predicate, and its generation/scan
+handle. Thus a self-join has two consumer contracts and two scan IDs; it does
+not infer either side from a shared path.
+
+The registry may release its reference when a newer generation is created or
+when the statement finishes, but it cannot destroy a binding still held by a
+logical-plan copy, physical plan, split, or active reader. New version evidence
+creates a new `FilePlan`/`BoundScan`; an in-flight consumer never swaps to that
+new object. A version mismatch during data reads is a source-version conflict,
+not a request to refresh the footer in place. Cancellation and terminal bind
+failure remove the registry's own references after their consumers are gone.
+
+Copy/deserialize carries only `(generation, scan_instance_id)`, a binding
+fingerprint, and the small consumer/optimizer descriptors needed by that copy.
+It resolves the same registry entry in the same connection and process. It
+must perform neither network I/O nor glob/listing expansion, and it cannot be
+used to restore a plan after process restart. Failure is classified as one of:
+
+- invalid or missing scan handle;
+- generation or fingerprint mismatch;
+- detected source-version conflict;
+- capability/semantic decline before a GPU plan is committed; or
+- ordinary source/bind failure (permissions, corruption, cancellation), which
+  must not be disguised as a capability decline.
+
+The common contract deliberately leaves source mechanics with adapters:
+`BoundParquetPayload` may expose Parquet schema and row-group details, while
+`BoundIcebergPayload` owns snapshot, manifest, and delete relationships. The
+planner and scan manager consume only the common identity/lifetime contract
+plus the selected adapter payload; they never reconstruct a file list from
+table-function parameters.
+
+## A3 FilePlan and row-group-slice consumption contract
+
+`FilePlan` is immutable bind output; a split is immutable execution work
+derived from it. The scan manager may prune row groups, coalesce work, choose
+prefetch ranges, and attach a reader, but it may not replace a file's footer,
+physical mapping, version evidence, or original row positions. Dynamic filters
+are execution input: they can reduce selected work or rows, but cannot change
+the bound file set.
+
+| Required `FilePlan` / slice property | Existing carrier | Required rule for the BoundScan path |
+| --- | --- | --- |
+| Canonical file identity and source evidence | `parquet_ingestible_table_info::resolved_file_paths`; the current single-file fields carry footer, size, ETag, and local version. | One `FilePlan` owns the canonical file identity and its bind evidence. The temporary single-file fields become the one-file projection of this structure; multi-file scans must never recover identity from table-function arguments. |
+| Parsed footer and physical schema mapping | `parquet_file_scan_info::file_metadata`, then `row_group_slice::file_metadata`; `scan_plan` maps DuckDB output to reader data columns. | The `FilePlan` holds the parsed footer and adapter mapping. `scan_plan` remains the optimized *consumer* layout; it does not become a substitute for per-file schema/field mapping. |
+| Selected row groups and original row offsets | `row_group_slice::row_group_indices`; Iceberg `build_batch_layout` computes each selected group's file offset as the prefix sum over **all** footer row groups. | A slice names only selected row-group indexes, in file order. Its provenance includes each row group's original first row, or enough immutable footer information to derive it exactly; pruning must never renumber positions. |
+| Read-byte and memory estimates | `parquet_file_scan_info::row_group_entry` records output, decode-working, compressed bytes; `parquet_split_info` sums them. | Estimates travel from the bound footer into a file plan and then the slice. They are planning/accounting values, not proof that a page can be read from a different version. |
+| Physical read and prefetch | `row_group_slice::datasource`; `parquet_split_info::fadvise_entries()` derives projected column-chunk ranges using `reader_options`. | A slice may own a duplicated datasource/prefetch handle while sharing its `FilePlan` evidence and footer. This transient read handle must be version-validated by the backend and cannot be used as a cache identity by itself. |
+| Projection, static predicate, and partition values | `scan_plan`, `parquet_reader_options`, `parquet_split_info::partition_values`, and `disable_filter_pushdown`. | These are immutable consumer-contract values after physical planning. Static predicates may prune from bound metadata; dynamic filters remain separate runtime input. Hive values must remain attached to the file/split that produced them. |
+| Delete plan and row provenance | `iceberg_gpu_ingestible::build_batch_layout` turns slices into `batch_row_run` before its delete pipeline. | Iceberg's adapter payload attaches the applicable delete plan to each file/slice. It is applied using original file row positions before SQL row predicates or dynamic filtering. Parquet's common `FilePlan` has no Iceberg member. |
+| Ownership and generation | Current `parquet_split_info` has no scan/generation owner fields. | Every emitted slice carries `(generation, scan_instance_id, consumer_id)` or an immutable owner object containing them. Decode rejects a slice whose owner does not match its active consumer, preventing cross-scan or old-generation work from entering a reader. |
+
+The current flow is therefore: `parquet_ingestible_table_info` supplies bind
+and DuckDB planning inputs; `parquet_gpu_ingestible::build_file_scan_info`
+creates one `parquet_file_scan_info` per file; the batch coalescer converts its
+pruned `row_group_entry` values to `row_group_slice`; and `parquet_split_info`
+adds shared reader options and `scan_plan` before `materialize_metadata_to_table`
+reads the slices. The BoundScan migration preserves that execution pipeline,
+but changes its first input from paths plus optional single-file metadata to
+bound `FilePlan` objects. The old DuckDB-bound path remains independent until
+the transparent-route switch is accepted.
+
+The all-pruned case is still a real execution split: the coalescer emits one
+zero-row-group slice so completion and the schema-correct empty result are
+preserved. It has the same owner contract as a nonempty slice and must not
+cause a fallback metadata fetch.
+
+## A4 GPU file-source capability matrix
+
+This matrix freezes the *Sirius-owned binder* admission policy. “Supported”
+means the binder must retain the corresponding semantic input in `BoundScan`
+and the physical path has a defined consumer; it does not authorize a router
+to silently drop an option. “Decline” means a recognized, legal invocation
+returns a classified `SiriusBindDecline` before a GPU plan is committed, so an
+original-function caller can perform a whole-query DuckDB rebind. Explicit
+Sirius functions remain GPU-only and report the classified reason instead.
+
+| Source feature | Sirius-owned binder policy | Bound view / enforcement |
+| --- | --- | --- |
+| Parquet, one local file | Supported. | Bind fixes URI, footer, schema/mapping, row-group layout and local size/mtime_ns evidence. The scan rechecks newly opened local evidence. |
+| Parquet, one S3 file | Supported. | Bind footer Range GET fixes ETag/size; every later range response compares its ETag. No separate HEAD is added. |
+| Parquet, multiple explicit files | Supported after C1, not yet implemented by the current single-file bind. | Bind fixes caller order, one `FilePlan` per file, and all schemas/footers before optimizer callbacks. |
+| Parquet glob/listing | Supported after C1, with listing-as-observed semantics. | Bind records the one expanded ordered list; it does not promise an atomic directory snapshot and scan never expands again. |
+| Parquet Hive partitioning | Supported when DuckDB-equivalent option parsing and per-file partition values are bound. | Partition values and types belong to file/consumer contracts; filters may prune files but are not passed to a Parquet reader as physical columns. |
+| Parquet `union_by_name` | Supported after C1 only when all file mappings and type reconciliation are fully bound. | Binder constructs the output schema and per-file missing/physical-column mappings. Conflicting types, a corrupt footer, or an unsupported conversion fail as source/bind errors, never as silently ignored options. |
+| Parquet S3 with unavailable version evidence | Supported with explicit weak-evidence record and WARN at the response boundary. | Cache reuse is limited to the open/generation; correctness relies on the immutable-object convention. |
+| Iceberg `snapshot_from_id` | Supported only for the currently safe schema/deletion subset. | Bind fixes table UUID, metadata location, snapshot ID, schema ID, manifests, data/delete files and all file footers in one view. |
+| Iceberg `current`, `snapshot_from_timestamp`, or `version` selector | Decline in this phase. | The existing GPU path cannot prove that independently discovered deletes match DuckDB's selected snapshot. A later binder may support these only by resolving and retaining one snapshot view. |
+| Iceberg safe, unchanged schema | Supported. | Data-file field IDs, names, types and order must pass the existing conservative schema gate using the bound footers. |
+| Iceberg schema evolution, name/default mapping, field-ID gaps, missing IDs, reordered columns, or type promotion | Decline in this phase. | These are valid Iceberg shapes, but current GPU mapping cannot prove equivalent semantics. They must not be admitted merely because a name-based Parquet read happens to work. |
+| Iceberg positional deletes | Supported for the safe snapshot subset. | File plans retain original row positions; delete application precedes SQL row predicates and dynamic filtering. |
+| Iceberg V3 deletion vectors | Supported for the safe snapshot subset, subject to existing Puffin validation. | The bound delete payload records the data-file relationship; malformed, retired, or misbound vectors are source failures/declines according to the validation boundary, never ignored. |
+| Iceberg equality deletes | Decline in this phase. | Current GPU scan does not force-project/delete-match all equality key semantics. The binder must retain the rejection until a separately tested implementation covers IDs, sequence numbers, NULLs, types and ordering. |
+| Iceberg `allow_moved_paths=true` | Decline in this phase. | Existing data-path rewriting does not share identity with manifest delete paths; accepting it could drop deletes. |
+
+Capability checking occurs after normal parameter binding/overload selection,
+so malformed arguments, permissions failures, cancellation, and corrupted
+metadata remain ordinary errors. The route only converts a known, legal but
+unsupported semantic shape into `SiriusBindDecline`. This makes CPU replay a
+new complete DuckDB bind/execute attempt rather than a mixed plan that has
+lost an option or partially reused Sirius metadata.
+
 ## Reproduction anchors
 
 The following tests provide the starting coverage matrix. They should gain
