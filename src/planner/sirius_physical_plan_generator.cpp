@@ -173,10 +173,12 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const* bind =
       dynamic_cast<duckdb::SiriusReadParquetBindData const*>(scan_op.bind_data.get());
-    if (!bind || bind->files().size() != info->resolved_file_paths.size()) {
+    if (!bind || !bind->bound_scan || bind->files().size() != info->resolved_file_paths.size()) {
       throw std::runtime_error(
         "Sirius-owned Parquet scan has no bound footer metadata for every input file");
     }
+    info->bound_scan       = bind->bound_scan;
+    info->scan_instance_id = bind->scan_instance_id();
     info->bound_files.reserve(bind->files().size());
     for (auto const& file : bind->files()) {
       if (!file.file_metadata) {

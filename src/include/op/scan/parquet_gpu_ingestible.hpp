@@ -53,6 +53,10 @@ namespace sirius::op {
 class sirius_dynamic_filter_set;
 }  // namespace sirius::op
 
+namespace duckdb {
+struct SiriusParquetBoundScan;
+}
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -77,6 +81,12 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
+  /// Retains the exact immutable Sirius-owned bind through physical planning
+  /// and scan construction. Null for the independent DuckDB-bound path.
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan;
+  /// Kept alongside the pointer so downstream ownership checks need not derive
+  /// identity from a path or an unstable traversal order.
+  uint64_t scan_instance_id{0};
   std::vector<bound_file> bound_files;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
@@ -137,6 +147,11 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths);
  */
 class parquet_split_info : public scan_info {
  public:
+  /// The immutable Sirius-owned bind that produced this split. Null for the
+  /// independent DuckDB-bound path.
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan;
+  uint64_t generation{0};
+  uint64_t scan_instance_id{0};
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;

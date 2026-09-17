@@ -32,6 +32,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <sirius_extension.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
@@ -241,10 +242,12 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
+      _bound_scan(std::move(bound_scan)),
       _needs_assembly(needs_output_assembly(*_plan))
   {
   }
@@ -299,7 +302,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_output,
                            cur_working,
                            cur_comp,
-                           std::move(slice_ds));
+                           std::move(slice_ds),
+                           _bound_scan ? _bound_scan->generation : 0,
+                           _bound_scan ? _bound_scan->scan_instance_id : 0);
       _produced_any = true;
       _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
@@ -349,7 +354,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_output_bytes=*/0,
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
-                           _empty_split_fallback->datasource);
+                           _empty_split_fallback->datasource,
+                           _bound_scan ? _bound_scan->generation : 0,
+                           _bound_scan ? _bound_scan->scan_instance_id : 0);
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
@@ -363,6 +370,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::unique_ptr<scan_info> emit_current()
   {
     auto split                     = std::make_unique<parquet_split_info>();
+    split->bound_scan              = _bound_scan;
+    split->generation              = _bound_scan ? _bound_scan->generation : 0;
+    split->scan_instance_id        = _bound_scan ? _bound_scan->scan_instance_id : 0;
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
@@ -378,6 +388,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   const std::size_t _cap;
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> _bound_scan;
   const bool _needs_assembly;
 
   std::vector<row_group_slice> _slices;
@@ -633,7 +644,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->bound_scan);
 }
 
 //===----------------------------------------------------------------------===//
@@ -679,6 +690,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // use the footer-probe hint.
   auto const* bound_file =
     _info->bound_files.empty() ? nullptr : &_info->bound_files.at(file_index);
+  if (_info->bound_scan && bound_file == nullptr) {
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] Sirius-owned scan lost its per-file bound footer record");
+  }
   auto const& bound_file_metadata = bound_file ? bound_file->metadata : nullptr;
   std::shared_ptr<io::sirius_datasource> sirius_ds =
     bound_file
@@ -707,6 +722,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = bound_file_metadata;
+  if (_info->bound_scan && !file_metadata) {
+    // A Sirius-owned bind has already completed every footer probe. Re-fetching
+    // here would silently mix this generation's fixed read view with a newer
+    // object, so this is an invariant violation rather than a cache miss.
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] Sirius-owned scan lost its bound parquet footer");
+  }
   if (!file_metadata && sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
@@ -1085,6 +1107,20 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
+  if (_info->bound_scan) {
+    if (split.bound_scan != _info->bound_scan || split.generation != _info->bound_scan->generation ||
+        split.scan_instance_id != _info->bound_scan->scan_instance_id) {
+      throw sirius::internal_exception(
+        "[parquet_gpu_ingestible] refusing a split owned by a different Sirius file scan");
+    }
+    for (auto const& slice : split.rg_slices) {
+      if (slice.generation != split.generation ||
+          slice.scan_instance_id != split.scan_instance_id) {
+        throw sirius::internal_exception(
+          "[parquet_gpu_ingestible] refusing a row-group slice owned by a different Sirius file scan");
+      }
+    }
+  }
 
   std::vector<std::unique_ptr<cudf::io::datasource>> sources;
   std::vector<cudf::io::parquet::FileMetaData> metadatas;
