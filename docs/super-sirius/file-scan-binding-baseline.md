@@ -45,6 +45,15 @@ execution copies.
    footer probe and S3's size-discovery HEAD; it also skips the metadata-store
    fallback. The resulting row-group slices retain the same parsed footer object.
 
+The target S3 policy is response-driven: the footer-probe Range GET supplies
+the bind ETag and `Content-Range` supplies the full object size. Every later
+range-read response must compare its ETag with that bound value. A missing
+response ETag emits a WARN and falls back to the documented immutable-object
+assumption; a differing ETag is a version conflict, never a reason to refresh
+the footer in place. This comparison has no separate HEAD request. ETag
+propagation and comparison are not implemented by this initial footer/size
+handoff yet.
+
 This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
 does not provide version evidence, multi-file binding, serialization, query
 registry ownership, or an Iceberg snapshot binding contract.
