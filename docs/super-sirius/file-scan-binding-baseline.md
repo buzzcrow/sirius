@@ -64,6 +64,28 @@ This closes only the single-file, Sirius-owned scan-to-ingestible handoff. It
 does not provide multi-file binding, serialization, query registry ownership,
 cache version isolation, or an Iceberg snapshot binding contract.
 
+## A1 source trace: bind through execute
+
+The following is the current source-level trace. “Rebind” means a new DuckDB
+bind/optimize attempt, not merely a logical-plan copy.
+
+| Source / shape | Bind-time metadata | Optimizer/finalize/execution behavior | CPU replay / identity risk |
+| --- | --- | --- | --- |
+| Local `read_parquet` / `parquet_scan` | DuckDB produces `MultiFileBindData`, including its expanded files; Sirius later resolves that list and may fetch/parse each footer in `build_file_scan_info`. | The optimizer captures a plan copy. If `LogicalGet::Copy` fails, finalize validates a re-planned logical plan and execution replans SQL again. | Runtime fallback replays the original SQL. File expansion/footer work can therefore repeat; source identity is the DuckDB bind-data file list, not a Sirius handle. |
+| S3 `read_parquet` rewritten to `sirius_read_parquet` | Sirius bind does a footer Range GET and records URI, parsed footer, size and ETag. | Copy preserves this bind payload when DuckDB can copy it. The non-copyable path still reparses/rebinds SQL at execution. | S3 CPU fallback is intentionally rejected; a rebind can nevertheless repeat the footer probe. |
+| `iceberg_scan` | DuckDB binds `MultiFileBindData`; Sirius additionally invokes Iceberg metadata/delete discovery and schema gates. | The same non-copyable `LogicalGet` finalize/execution replan branch applies. | A replay/redrive can rediscover table metadata, manifests and deletes; current source identity is path/bind data, not a fixed snapshot handle. |
+| View over a file source | The view body is bound as part of the outer query and follows its underlying source row above. | Optimizer capture and any SQL replan bind the view body again. | The view name is not a stable file-source identity; the underlying table function/bind data is. |
+| Prepared statement, including self-join | Prepare performs the initial bind/finalize. Every execution of a Sirius-backed prepared plan requests `ATTEMPT_TO_REBIND`, so it receives a fresh bind/optimize/finalize attempt. A self-join has two `LogicalGet` consumers and must eventually receive two consumption contracts, even where their source is identical. | Each execution is the current practical generation boundary, but no generation-scoped scan registry exists. | CPU-only prepared plans can remain cached; Sirius-backed ones deliberately rebind to re-evaluate eligibility. |
+
+`sirius_optimizer_hook` records a copy stamped with the connection planning
+generation. `OnFinalizePrepare` consumes that capture; if copying a logical get
+is impossible, it validates a fresh SQL replan and leaves
+`PhysicalSiriusExecution` with no logical plan. On first execution that operator
+again parses/binds/optimizes the cached SQL before Sirius physical planning.
+`OnExecutePrepared` asks DuckDB to repeat this cycle for a reused Sirius-backed
+prepared statement. These are the precise seams where `BoundScan` must replace
+path-based rediscovery.
+
 ## Reproduction anchors
 
 The following tests provide the starting coverage matrix. They should gain
