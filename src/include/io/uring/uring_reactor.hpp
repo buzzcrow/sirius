@@ -92,7 +92,8 @@ class local_io_object : public sirius_io_object {
       _fd(std::move(fd)),
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size),
-      _local_version(std::move(local_version))
+      _local_version(std::move(local_version)),
+      _cache_id(local_file_cache_id(_path, _local_version))
   {
     if (hash.empty()) {
       _hash = _path;
@@ -101,7 +102,7 @@ class local_io_object : public sirius_io_object {
     }
   }
 
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] local_file_version local_version() const noexcept override
@@ -123,6 +124,7 @@ class local_io_object : public sirius_io_object {
   file_descriptor _fd_direct;
   size_t _file_size{0};
   local_file_version _local_version;
+  std::string _cache_id;
 };
 
 // ---------------------------------------------------------------------------

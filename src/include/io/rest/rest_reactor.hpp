@@ -92,7 +92,8 @@ class rest_io_object : public sirius_io_object {
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(size),
-      _etag(std::move(etag))
+      _etag(std::move(etag)),
+      _cache_id(etag_file_cache_id(_path, _etag))
   {
   }
 
@@ -112,11 +113,12 @@ class rest_io_object : public sirius_io_object {
       _file_size(object_size),
       _window_lo(window_lo),
       _stash(std::move(stash)),
-      _etag(std::move(etag))
+      _etag(std::move(etag)),
+      _cache_id(etag_file_cache_id(_path, _etag))
   {
   }
 
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_etag() const noexcept override { return _etag; }
@@ -142,6 +144,7 @@ class rest_io_object : public sirius_io_object {
   size_t _window_lo{0};
   std::shared_ptr<const std::vector<std::uint8_t>> _stash;
   std::string _etag;
+  std::string _cache_id;
 };
 
 // ---------------------------------------------------------------------------

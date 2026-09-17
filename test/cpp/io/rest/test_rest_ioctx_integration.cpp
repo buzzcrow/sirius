@@ -1474,6 +1474,20 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   CHECK(server.get_count() == 1);
 }
 
+TEST_CASE("rest cache identity includes object version evidence", "[s3][rest][cache]")
+{
+  using sirius::io::rest::rest_io_object;
+  rest_io_object v1{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object same{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object v2{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v2\""};
+  rest_io_object no_tag_a{"s3://bucket/key.parquet", "bucket", "key.parquet", 100};
+  rest_io_object no_tag_b{"s3://bucket/key.parquet", "bucket", "key.parquet", 100};
+
+  CHECK(v1.raw_file_cache_id() == same.raw_file_cache_id());
+  CHECK(v1.raw_file_cache_id() != v2.raw_file_cache_id());
+  CHECK(no_tag_a.raw_file_cache_id() != no_tag_b.raw_file_cache_id());
+}
+
 TEST_CASE("rest range reads validate a bound ETag without HEAD", "[s3][integration][rest][etag]")
 {
   auto payload = deterministic_payload(4096);

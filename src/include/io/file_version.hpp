@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include <sys/stat.h>
 
@@ -54,6 +56,29 @@ inline local_file_version local_file_version_from_fd(int fd) noexcept
           static_cast<std::size_t>(st.st_size),
           static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1000000000LL +
             static_cast<std::int64_t>(st.st_mtim.tv_nsec)};
+}
+
+/// Cache identity for a local file. Versioned files can share an entry; an
+/// unavailable version is deliberately isolated to one open, never reused by
+/// a later query that happens to use the same path.
+inline std::string local_file_cache_id(std::string const& path, local_file_version version)
+{
+  if (version.available) {
+    return path + "\x1flocal:" + std::to_string(version.size) + ":" +
+           std::to_string(version.mtime_ns);
+  }
+  static std::atomic<std::uint64_t> next_id{0};
+  return path + "\x1funversioned:" + std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+}
+
+/// Cache identity for an object-store response. ETags are opaque equality
+/// tokens; without one, isolate the entry to this open rather than sharing a
+/// path-only entry with a later generation.
+inline std::string etag_file_cache_id(std::string const& path, std::string const& etag)
+{
+  if (!etag.empty()) { return path + "\x1f" "etag:" + etag; }
+  static std::atomic<std::uint64_t> next_id{0};
+  return path + "\x1funversioned:" + std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
 }
 
 }  // namespace io

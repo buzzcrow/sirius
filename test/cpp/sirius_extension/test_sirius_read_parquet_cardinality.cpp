@@ -100,6 +100,12 @@ TEST_CASE("SiriusReadParquetBindData preserves URI and row-count planner metadat
     {},
     sirius::io::local_file_version{true, orders_object_size, orders_local_version.mtime_ns + 1}};
   CHECK_FALSE(local_bind.Equals(different_local_version));
+  CHECK(sirius::io::local_file_cache_id("/data/orders.parquet", orders_local_version) ==
+        sirius::io::local_file_cache_id("/data/orders.parquet", orders_local_version));
+  CHECK(sirius::io::local_file_cache_id("/data/orders.parquet", orders_local_version) !=
+        sirius::io::local_file_cache_id(
+          "/data/orders.parquet",
+          sirius::io::local_file_version{true, orders_object_size, orders_local_version.mtime_ns + 1}));
 }
 
 TEST_CASE("SiriusReadParquetCardinality returns exact DuckDB node statistics",

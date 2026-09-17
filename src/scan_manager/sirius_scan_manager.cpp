@@ -1365,16 +1365,10 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will actually read + parse the footer.  On a warm
-  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
-  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
-  auto const cache_key     = normalize_path(uri);
-  auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-  auto const hint =
-    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
-
-  auto datasource = create_datasource(uri, hint);
+  // Every bind uses a footer Range GET. Its response supplies the versioned
+  // cache key, so an overwritten path cannot reuse a prior footer. A matching
+  // ETag still reuses the parsed metadata after this one validation request.
+  auto datasource = create_datasource(uri, sirius::io::open_hint::parquet_footer_probe);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
