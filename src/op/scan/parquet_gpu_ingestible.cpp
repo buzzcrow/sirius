@@ -485,9 +485,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   : _info(std::move(info))
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
-  if (bind.bound_file_metadata && bind.resolved_file_paths.size() != 1) {
+  if (!bind.bound_files.empty() && bind.bound_files.size() != bind.resolved_file_paths.size()) {
     throw sirius::internal_exception(
-      "[parquet_gpu_ingestible] single-file bound metadata requires exactly one input file");
+      "[parquet_gpu_ingestible] bound footer metadata must align with every input file");
   }
 
   // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
@@ -658,8 +658,8 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, io_ctx);
+  return [this, idx, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(idx, file_path, io_ctx);
   };
 }
 
@@ -667,7 +667,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::size_t file_index,
+  std::string const& file_path,
+  std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -675,21 +677,24 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // are already fixed for this scan, so reuse the size and skip both the S3
   // footer probe and a second size-discovery HEAD. DuckDB-bound scans still
   // use the footer-probe hint.
-  auto const bound_file_metadata = _info->bound_file_metadata;
-  std::shared_ptr<io::sirius_datasource> sirius_ds = bound_file_metadata
-    ? io_ctx->open_datasource(
-        file_path, _info->bound_file_object_size, _info->bound_file_validation_etag)
-    : io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+  auto const* bound_file =
+    _info->bound_files.empty() ? nullptr : &_info->bound_files.at(file_index);
+  auto const& bound_file_metadata = bound_file ? bound_file->metadata : nullptr;
+  std::shared_ptr<io::sirius_datasource> sirius_ds =
+    bound_file
+      ? io_ctx->open_datasource(file_path, bound_file->object_size, bound_file->validation_etag)
+      : io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
-  if (_info->bound_file_local_version.available) {
+  if (bound_file && bound_file->local_version.available) {
     auto const opened_version = sirius_ds->io_object().local_version();
     if (!opened_version.available) {
-      SIRIUS_LOG_WARN("[parquet_gpu_ingestible] local file '{}' has no version evidence at scan; "
-                      "falling back to the immutable-file convention",
-                      file_path);
-    } else if (opened_version != _info->bound_file_local_version) {
+      SIRIUS_LOG_WARN(
+        "[parquet_gpu_ingestible] local file '{}' has no version evidence at scan; "
+        "falling back to the immutable-file convention",
+        file_path);
+    } else if (opened_version != bound_file->local_version) {
       throw std::runtime_error("[parquet_gpu_ingestible] local file version conflict for '" +
                                file_path + "'");
     }

@@ -66,19 +66,18 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  /// One bound footer/version record per resolved Sirius-owned input. Empty
+  /// for the independent DuckDB-bound compatibility path.
+  struct bound_file {
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> metadata;
+    std::size_t object_size{0};
+    std::string validation_etag;
+    sirius::io::local_file_version local_version;
+  };
+
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
-  /// Metadata fixed at Sirius bind for the single-file Sirius-owned route.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> bound_file_metadata;
-  /// Size observed with @ref bound_file_metadata. Object-store scans pass it
-  /// to the IO backend to avoid a second size-discovery HEAD.
-  std::size_t bound_file_object_size{0};
-  /// Footer Range GET ETag for S3. Passed to the datasource so every data
-  /// range response can be checked against the bound object.
-  std::string bound_file_validation_etag;
-  /// Bind-time local size/mtime evidence. The scan compares it against the
-  /// newly opened local file, then releases that descriptor normally.
-  sirius::io::local_file_version bound_file_local_version;
+  std::vector<bound_file> bound_files;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
@@ -355,7 +354,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+  std::unique_ptr<scan_info> build_file_scan_info(std::size_t file_index,
+                                                  std::string const& file_path,
                                                   std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;

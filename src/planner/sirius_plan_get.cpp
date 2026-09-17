@@ -620,6 +620,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     "parquet_scan",
     "read_parquet",
     "sirius_read_parquet",
+    "sirius_parquet_scan",
     "iceberg_scan",
     sirius::exec::kStreamSourceFunctionName};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {

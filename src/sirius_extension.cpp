@@ -267,9 +267,47 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
                                                vector<string>& names)
 {
   if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
-    throw std::runtime_error("sirius_read_parquet expects a single non-null parquet URI");
+    throw BinderException(
+      "sirius_parquet_scan expects one non-null parquet URI or a non-empty list of non-null URIs");
   }
-  auto const uri = input.inputs[0].GetValue<std::string>();
+  vector<string> uris;
+  auto const& source = input.inputs[0];
+  if (source.type().id() == LogicalTypeId::LIST) {
+    for (auto const& value : ListValue::GetChildren(source)) {
+      if (value.IsNull()) {
+        throw BinderException("sirius_parquet_scan URI lists cannot contain NULL values");
+      }
+      uris.push_back(value.GetValue<string>());
+    }
+    if (uris.empty()) { throw BinderException("sirius_parquet_scan URI list cannot be empty"); }
+  } else {
+    uris.push_back(source.GetValue<string>());
+  }
+
+  // Freeze glob expansion at Sirius bind. Do not leave a wildcard in the
+  // physical scan, where a later expansion could observe a different file set.
+  // Keep caller-list order while sorting matches within each glob so the bound
+  // file order is deterministic for a given listing response.
+  auto& fs = FileSystem::GetFileSystem(context);
+  vector<string> expanded_uris;
+  for (auto const& uri : uris) {
+    if (!FileSystem::HasGlob(uri)) {
+      expanded_uris.push_back(uri);
+      continue;
+    }
+    auto matches = fs.GlobFiles(uri);
+    if (matches.empty()) {
+      throw InvalidInputException("sirius_parquet_scan glob matched no files: " + uri);
+    }
+    vector<string> paths;
+    paths.reserve(matches.size());
+    for (auto const& match : matches) {
+      paths.push_back(match.path);
+    }
+    std::sort(paths.begin(), paths.end());
+    expanded_uris.insert(expanded_uris.end(), paths.begin(), paths.end());
+  }
+  uris = std::move(expanded_uris);
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
@@ -281,16 +319,30 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     sirius_ctx->throw_runtime_unavailable();
   }
 
-  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
-  return_types     = std::move(bind_result.return_types);
-  names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(
-    uri,
-    bind_result.total_num_rows,
-    std::move(bind_result.file_metadata),
-    bind_result.object_size,
-    std::move(bind_result.validation_etag),
-    std::move(bind_result.local_version));
+  std::vector<SiriusParquetFileBindData> files;
+  files.reserve(uris.size());
+  std::size_t total_num_rows = 0;
+  for (auto const& uri : uris) {
+    auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
+    if (files.empty()) {
+      return_types = std::move(bind_result.return_types);
+      names        = std::move(bind_result.names);
+    } else if (bind_result.return_types != return_types || bind_result.names != names) {
+      throw NotImplementedException(
+        "sirius_parquet_scan currently requires every input file to have the same schema; "
+        "union_by_name and schema reconciliation are not implemented yet");
+    }
+    if (bind_result.total_num_rows > std::numeric_limits<std::size_t>::max() - total_num_rows) {
+      throw BinderException("sirius_parquet_scan total row count exceeds SIZE_MAX");
+    }
+    total_num_rows += bind_result.total_num_rows;
+    files.push_back({uri,
+                     std::move(bind_result.file_metadata),
+                     bind_result.object_size,
+                     std::move(bind_result.validation_etag),
+                     std::move(bind_result.local_version)});
+  }
+  return make_uniq<SiriusReadParquetBindData>(std::move(files), total_num_rows);
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -2496,19 +2548,23 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
   // Public, GPU-only counterpart of the internal compatibility entry point.
-  // It deliberately has the same narrow single-URI contract today: it enters
-  // the Sirius-owned bind path and carries the resulting footer/evidence to
-  // physical planning. Multi-file/listing options arrive with the shared
-  // Parquet source binder (C1), rather than being accepted and ignored here.
-  TableFunction sirius_parquet_scan("sirius_parquet_scan",
-                                    {LogicalType::VARCHAR},
-                                    SiriusParquetScanFunction,
-                                    SiriusReadParquetBind);
-  sirius_parquet_scan.cardinality         = SiriusReadParquetCardinality;
-  sirius_parquet_scan.projection_pushdown = true;
-  sirius_parquet_scan.filter_pushdown     = true;
-  sirius_parquet_scan.filter_prune        = true;
-  CreateTableFunctionInfo sirius_parquet_scan_info(sirius_parquet_scan);
+  // The list overload is intentionally schema-strict: it binds every footer
+  // and its version evidence, but does not yet claim union_by_name semantics.
+  TableFunctionSet sirius_parquet_scan_set("sirius_parquet_scan");
+  auto add_sirius_parquet_scan = [&](LogicalType argument) {
+    TableFunction sirius_parquet_scan("sirius_parquet_scan",
+                                      {std::move(argument)},
+                                      SiriusParquetScanFunction,
+                                      SiriusReadParquetBind);
+    sirius_parquet_scan.cardinality         = SiriusReadParquetCardinality;
+    sirius_parquet_scan.projection_pushdown = true;
+    sirius_parquet_scan.filter_pushdown     = true;
+    sirius_parquet_scan.filter_prune        = true;
+    sirius_parquet_scan_set.AddFunction(std::move(sirius_parquet_scan));
+  };
+  add_sirius_parquet_scan(LogicalType::VARCHAR);
+  add_sirius_parquet_scan(LogicalType::LIST(LogicalType::VARCHAR));
+  CreateTableFunctionInfo sirius_parquet_scan_info(sirius_parquet_scan_set);
   catalog.CreateTableFunction(transaction, sirius_parquet_scan_info);
 
   TableFunction set_query_label("sirius_set_query_label",

@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 struct sirius_config;
@@ -38,20 +39,15 @@ namespace duckdb {
 class GPUBufferManager;
 struct DBConfig;
 
-// Bind-time payload for the sirius_read_parquet table function. Carries the
-// canonical URI and parquet footer row count. The physical planner consumes
-// this URI and footer directly, while DuckDB's optimizer sees a real
-// cardinality estimate via the registered callback instead of falling back to
-// "unknown table function output".
-struct SiriusReadParquetBindData : public FunctionData {
-  SiriusReadParquetBindData(std::string uri,
-                            std::size_t total_num_rows,
-                            std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
-                            std::size_t object_size = 0,
-                            std::string validation_etag = {},
-                            sirius::io::local_file_version local_version = {})
+/// Immutable evidence captured at bind for one Sirius-owned Parquet input.
+struct SiriusParquetFileBindData {
+  SiriusParquetFileBindData() = default;
+  SiriusParquetFileBindData(std::string uri,
+                            std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
+                            std::size_t object_size,
+                            std::string validation_etag,
+                            sirius::io::local_file_version local_version)
     : uri(std::move(uri)),
-      total_num_rows(total_num_rows),
       file_metadata(std::move(file_metadata)),
       object_size(object_size),
       validation_etag(std::move(validation_etag)),
@@ -59,6 +55,57 @@ struct SiriusReadParquetBindData : public FunctionData {
   {
   }
 
+  std::string uri;
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::size_t object_size{0};
+  std::string validation_etag;
+  sirius::io::local_file_version local_version;
+
+  bool operator==(SiriusParquetFileBindData const& other) const
+  {
+    return uri == other.uri && file_metadata == other.file_metadata &&
+           object_size == other.object_size && validation_etag == other.validation_etag &&
+           local_version == other.local_version;
+  }
+};
+
+// Bind-time payload for the sirius_read_parquet table function. Carries the
+// canonical ordered file list and parquet footer row count. The physical
+// planner consumes these bound objects directly, while DuckDB's optimizer sees
+// a real cardinality estimate via the registered callback.
+struct SiriusReadParquetBindData : public FunctionData {
+  SiriusReadParquetBindData(
+    std::string uri,
+    std::size_t total_num_rows,
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = nullptr,
+    std::size_t object_size                                              = 0,
+    std::string validation_etag                                          = {},
+    sirius::io::local_file_version local_version                         = {})
+    : SiriusReadParquetBindData(std::vector<SiriusParquetFileBindData>{{std::move(uri),
+                                                                        std::move(file_metadata),
+                                                                        object_size,
+                                                                        std::move(validation_etag),
+                                                                        std::move(local_version)}},
+                                total_num_rows)
+  {
+  }
+
+  SiriusReadParquetBindData(std::vector<SiriusParquetFileBindData> files,
+                            std::size_t total_num_rows)
+    : files(std::move(files)), total_num_rows(total_num_rows)
+  {
+    if (this->files.empty()) { return; }
+    // Compatibility mirrors for existing one-file callers. New consumers use
+    // `files`, which preserves evidence for every input in order.
+    auto const& first = this->files.front();
+    uri               = first.uri;
+    file_metadata     = first.file_metadata;
+    object_size       = first.object_size;
+    validation_etag   = first.validation_etag;
+    local_version     = first.local_version;
+  }
+
+  std::vector<SiriusParquetFileBindData> files;
   std::string uri;
   std::size_t total_num_rows{0};
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
@@ -72,16 +119,13 @@ struct SiriusReadParquetBindData : public FunctionData {
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(
-      uri, total_num_rows, file_metadata, object_size, validation_etag, local_version);
+    return make_uniq<SiriusReadParquetBindData>(files, total_num_rows);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadParquetBindData>();
-    return uri == other.uri && total_num_rows == other.total_num_rows &&
-           file_metadata == other.file_metadata && object_size == other.object_size &&
-           validation_etag == other.validation_etag && local_version == other.local_version;
+    return files == other.files && total_num_rows == other.total_num_rows;
   }
 };
 

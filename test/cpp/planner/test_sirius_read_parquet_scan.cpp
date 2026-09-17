@@ -127,5 +127,32 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     REQUIRE_FALSE(res->HasError());  // pre-fix: "Unsupported scan function: sirius_read_parquet"
     REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
     REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == kRows);
+
+    // The explicit entry binds every listed file before planning. A direct
+    // CPU execution would throw from SiriusParquetScanFunction, so this also
+    // proves the multi-file table scan reached the GPU path.
+    auto second_path = tmp / "kv_second.parquet";
+    generate_parquet(second_path);
+    auto multi = con.Query("SELECT max(k), count(*) FROM sirius_parquet_scan([" +
+                           sirius::test::sql_literal(parquet_path.string()) + ", " +
+                           sirius::test::sql_literal(second_path.string()) + "]); ");
+    REQUIRE(multi);
+    if (multi->HasError()) {
+      UNSCOPED_INFO("sirius_parquet_scan list query error: " << multi->GetError());
+    }
+    REQUIRE_FALSE(multi->HasError());
+    REQUIRE(multi->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
+    REQUIRE(multi->GetValue(1, 0).GetValue<int64_t>() == 2 * kRows);
+
+    auto const glob = (tmp / "kv*.parquet").string();
+    auto expanded   = con.Query("SELECT max(k), count(*) FROM sirius_parquet_scan(" +
+                              sirius::test::sql_literal(glob) + ");");
+    REQUIRE(expanded);
+    if (expanded->HasError()) {
+      UNSCOPED_INFO("sirius_parquet_scan glob query error: " << expanded->GetError());
+    }
+    REQUIRE_FALSE(expanded->HasError());
+    REQUIRE(expanded->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
+    REQUIRE(expanded->GetValue(1, 0).GetValue<int64_t>() == 2 * kRows);
   }
 }
