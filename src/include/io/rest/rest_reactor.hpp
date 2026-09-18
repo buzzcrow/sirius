@@ -56,9 +56,9 @@ namespace sirius::io::rest {
 
 /// Result of a suffix-range footer probe: the object's total size plus the
 /// trailing window [window_lo, object_size) captured in @c bytes.  @c bytes is
-/// null when the probe could not be satisfied (the caller then falls back to a
-/// HEAD).  Held by shared_ptr so the trailing bytes are shared, not copied, with
-/// the io_object that carries them for this open.
+/// null when the probe could not be satisfied. Held by shared_ptr so the
+/// trailing bytes are shared, not copied, with the io_object that carries them
+/// for this open.
 struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
@@ -319,8 +319,9 @@ class rest_reactor {
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
   /// window origin, the trailing bytes, and the ETag; on any unusable response
-  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so the caller
-  /// falls back to a HEAD.  @p bucket / @p key identify the object.
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null;
+  /// callers may fall back to HEAD for size and best-available ETag evidence.
+  /// @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 
   /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML

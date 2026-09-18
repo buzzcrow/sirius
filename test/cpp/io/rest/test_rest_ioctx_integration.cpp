@@ -1804,7 +1804,7 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   CHECK(server.get_count() == 2);
 }
 
-TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
+TEST_CASE("footer suffix probe falls back to HEAD size and ETag evidence",
           "[s3][integration][rest][footerbind]")
 {
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
@@ -1812,13 +1812,15 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
   SECTION("missing Content-Range")
   {
     range_fault_policy fault{};
-    fault.omit_content_range = true;
+    fault.omit_content_range   = true;
+    fault.successful_head_etag = "\"head-v1\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v1\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1827,14 +1829,36 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
   {
     range_fault_policy fault{};
     fault.unknown_content_range_total = true;
+    fault.successful_head_etag        = "\"head-v2\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v2\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
+  }
+
+  SECTION("fallback HEAD ETag validates later data ranges")
+  {
+    range_fault_policy fault{};
+    fault.ignore_range_with_200 = true;
+    fault.successful_get_etag   = "\"range-v2\"";
+    fault.successful_head_etag  = "\"head-v1\"";
+    range_http_server server(parquet, fault);
+    auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->io_object().validation_etag() == "\"head-v1\"");
+
+    std::array<std::uint8_t, 1> out{};
+    CHECK_THROWS_WITH(datasource->host_read(0, out.size(), out.data()),
+                      Catch::Matchers::Contains("S3 version conflict"));
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 2);
   }
 
   SECTION("server ignores Range with 200 full-body")
@@ -1842,13 +1866,14 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     range_fault_policy fault{};
     fault.ignore_range_with_200 = true;
     fault.successful_get_etag   = "\"discarded-200-tag\"";
+    fault.successful_head_etag  = "\"head-v3\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
-    CHECK(datasource->io_object().validation_etag().empty());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v3\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1866,6 +1891,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == payload.size());
+    CHECK(datasource->io_object().validation_etag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
     CHECK(server.body_bytes_sent() < payload.size());
@@ -1883,6 +1909,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }

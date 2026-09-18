@@ -256,9 +256,18 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
   footer_probe probe = _reactors.front()->fetch_footer_suffix(
     parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
   if (!probe.bytes) {
-    // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
-    // fall back to a plain HEAD for the size, with no stash.
+    // A malformed suffix response gives neither a usable footer window nor a
+    // total object size. Preserve the established fallback: HEAD supplies the
+    // metadata needed to construct the datasource and its ETag is the best
+    // version evidence available for this read attempt.
     auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
+    if (head.etag.empty()) {
+      SIRIUS_LOG_WARN(
+        "rest_ioctx: footer Range GET could not establish size/ETag for s3://{}/{}; "
+        "HEAD fallback has no ETag, using the immutable-object assumption",
+        parsed.host,
+        parsed.path);
+    }
     return std::make_shared<rest_io_object>(std::move(path),
                                             std::move(parsed.host),
                                             std::move(parsed.path),
@@ -266,10 +275,11 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
                                             std::move(head.etag));
   }
   if (probe.etag.empty()) {
-    SIRIUS_LOG_WARN("rest_ioctx: footer Range GET has no ETag for s3://{}/{}; "
-                    "falling back to the immutable-object assumption",
-                    parsed.host,
-                    parsed.path);
+    SIRIUS_LOG_WARN(
+      "rest_ioctx: footer Range GET has no ETag for s3://{}/{}; "
+      "falling back to the immutable-object assumption",
+      parsed.host,
+      parsed.path);
   }
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),
