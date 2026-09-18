@@ -72,7 +72,7 @@ than `:latest` so the same Sirius commit is reproducible over time:
 
 | image | tag |
 |---|---|
-| `minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
+| `quay.io/minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
 
 To bump it, edit `kMinioImage` in `test/cpp/utils/s3_container.cpp` and confirm
 `make s3-test` still passes.

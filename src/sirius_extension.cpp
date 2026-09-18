@@ -22,6 +22,10 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -41,6 +45,8 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <cstring>
+#include <cmath>
+#include <limits>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -415,6 +421,7 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   if (bind_data_p == nullptr) { return nullptr; }
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
+  typed->scan().metering.cardinality_requests.fetch_add(1, std::memory_order_relaxed);
   return make_uniq<NodeStatistics>(typed->total_num_rows(), typed->total_num_rows());
 }
 
@@ -430,8 +437,18 @@ std::optional<T> parquet_stat_scalar(std::vector<std::uint8_t> const& bytes)
 }
 
 std::optional<Value> decode_exact_parquet_stat(std::vector<std::uint8_t> const& bytes,
-                                                LogicalType const& type)
+                                                LogicalType const& type,
+                                                sirius::scan::parquet_minmax_encoding encoding,
+                                                sirius::scan::parquet_stat_time_unit time_unit)
 {
+  auto scale_millis_to_micros = [](std::int64_t value) -> std::optional<std::int64_t> {
+    constexpr auto factor = std::int64_t{1000};
+    if (value > std::numeric_limits<std::int64_t>::max() / factor ||
+        value < std::numeric_limits<std::int64_t>::min() / factor) {
+      return std::nullopt;
+    }
+    return value * factor;
+  };
   switch (type.id()) {
     case LogicalTypeId::BOOLEAN:
       if (bytes.size() != 1 || (bytes[0] != 0 && bytes[0] != 1)) { return std::nullopt; }
@@ -456,8 +473,119 @@ std::optional<Value> decode_exact_parquet_stat(std::vector<std::uint8_t> const& 
       auto const raw = parquet_stat_scalar<std::uint64_t>(bytes);
       return raw ? std::optional<Value>{Value::UBIGINT(*raw)} : std::nullopt;
     }
+    case LogicalTypeId::FLOAT: {
+      auto const raw = parquet_stat_scalar<float>(bytes);
+      return raw && std::isfinite(*raw) ? std::optional<Value>{Value::FLOAT(*raw)} : std::nullopt;
+    }
+    case LogicalTypeId::DOUBLE: {
+      auto const raw = parquet_stat_scalar<double>(bytes);
+      return raw && std::isfinite(*raw) ? std::optional<Value>{Value::DOUBLE(*raw)} : std::nullopt;
+    }
+    case LogicalTypeId::DATE: {
+      auto const raw = parquet_stat_scalar<std::int32_t>(bytes);
+      return raw ? std::optional<Value>{Value::DATE(date_t{*raw})} : std::nullopt;
+    }
+    case LogicalTypeId::TIME: {
+      if (time_unit == sirius::scan::parquet_stat_time_unit::millis) {
+        auto const raw = parquet_stat_scalar<std::int32_t>(bytes);
+        auto const micros = raw ? scale_millis_to_micros(*raw) : std::nullopt;
+        return micros ? std::optional<Value>{Value::TIME(dtime_t{*micros})} : std::nullopt;
+      }
+      if (time_unit == sirius::scan::parquet_stat_time_unit::micros) {
+        auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+        return raw ? std::optional<Value>{Value::TIME(dtime_t{*raw})} : std::nullopt;
+      }
+      return std::nullopt;
+    }
+    case LogicalTypeId::TIMESTAMP_SEC: {
+      auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+      return raw ? std::optional<Value>{Value::TIMESTAMPSEC(timestamp_sec_t{*raw})} : std::nullopt;
+    }
+    case LogicalTypeId::TIMESTAMP_MS: {
+      auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+      return raw ? std::optional<Value>{Value::TIMESTAMPMS(timestamp_ms_t{*raw})} : std::nullopt;
+    }
+    case LogicalTypeId::TIMESTAMP: {
+      auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+      if (!raw) { return std::nullopt; }
+      if (time_unit == sirius::scan::parquet_stat_time_unit::millis) {
+        auto const micros = scale_millis_to_micros(*raw);
+        return micros ? std::optional<Value>{Value::TIMESTAMP(timestamp_t{*micros})} : std::nullopt;
+      }
+      return time_unit == sirius::scan::parquet_stat_time_unit::micros
+               ? std::optional<Value>{Value::TIMESTAMP(timestamp_t{*raw})}
+               : std::nullopt;
+    }
+    case LogicalTypeId::TIMESTAMP_NS: {
+      auto const raw = parquet_stat_scalar<std::int64_t>(bytes);
+      return raw ? std::optional<Value>{Value::TIMESTAMPNS(timestamp_ns_t{*raw})} : std::nullopt;
+    }
+    case LogicalTypeId::DECIMAL: {
+      auto const width = DecimalType::GetWidth(type);
+      auto const scale = DecimalType::GetScale(type);
+      // BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY decimals are signed two's-complement,
+      // big-endian. The immutable footer summary carries the schema proof;
+      // decode that representation before considering native scalar widths.
+      if (encoding == sirius::scan::parquet_minmax_encoding::big_endian_decimal) {
+        if (bytes.empty() || bytes.size() > sizeof(hugeint_t)) { return std::nullopt; }
+        std::uint64_t upper_bits = (bytes[0] & 0x80U) ? ~std::uint64_t{0} : 0;
+        std::uint64_t lower_bits = upper_bits;
+        for (auto byte : bytes) {
+          upper_bits = (upper_bits << 8U) | (lower_bits >> 56U);
+          lower_bits = (lower_bits << 8U) | byte;
+        }
+        auto const raw = hugeint_t{static_cast<std::int64_t>(upper_bits), lower_bits};
+        std::optional<Value> decimal;
+        if (width <= Decimal::MAX_WIDTH_INT64) {
+          // Do not narrow a 128-bit footer value before proving it is an int64.
+          if (!((raw.upper == 0 &&
+                 raw.lower <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) ||
+                (raw.upper == -1 && raw.lower >= (std::uint64_t{1} << 63U)))) {
+            return std::nullopt;
+          }
+          decimal = Value::DECIMAL(static_cast<std::int64_t>(raw.lower), width, scale);
+        } else {
+          decimal = Value::DECIMAL(raw, width, scale);
+        }
+        // A malformed footer can carry a value outside its declared decimal
+        // precision. It is evidence only when the logical domain agrees.
+        if (ValueOperations::LessThan(*decimal, Value::MinimumValue(type)) ||
+            ValueOperations::LessThan(Value::MaximumValue(type), *decimal)) {
+          return std::nullopt;
+        }
+        return decimal;
+      }
+      if (bytes.size() == sizeof(std::int32_t)) {
+        auto raw = parquet_stat_scalar<std::int32_t>(bytes);
+        return raw ? std::optional<Value>{Value::DECIMAL(*raw, width, scale)} : std::nullopt;
+      }
+      if (bytes.size() == sizeof(std::int64_t)) {
+        auto raw = parquet_stat_scalar<std::int64_t>(bytes);
+        return raw ? std::optional<Value>{Value::DECIMAL(*raw, width, scale)} : std::nullopt;
+      }
+      return std::nullopt;
+    }
+    case LogicalTypeId::UUID:
+      return bytes.size() == 16
+               ? std::optional<Value>{Value::UUID(BaseUUID::FromBlob(bytes.data()))}
+               : std::nullopt;
     default: return std::nullopt;
   }
+}
+
+bool exact_string_stat(std::vector<std::uint8_t> const& bytes, LogicalType const& type)
+{
+  return type.id() == LogicalTypeId::BLOB ||
+         (type.id() == LogicalTypeId::VARCHAR && Value::StringIsValid(
+                                                 std::string(reinterpret_cast<char const*>(bytes.data()), bytes.size())));
+}
+
+int compare_parquet_bytes(std::vector<std::uint8_t> const& lhs, std::vector<std::uint8_t> const& rhs)
+{
+  auto const common = std::min(lhs.size(), rhs.size());
+  auto const cmp = common == 0 ? 0 : std::memcmp(lhs.data(), rhs.data(), common);
+  if (cmp != 0) { return cmp; }
+  return lhs.size() < rhs.size() ? -1 : lhs.size() > rhs.size();
 }
 
 }  // namespace
@@ -468,8 +596,13 @@ unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext&,
 {
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
   if (typed == nullptr || typed->files().empty()) { return nullptr; }
+  typed->scan().metering.statistics_requests.fetch_add(1, std::memory_order_relaxed);
+  auto unavailable = [&] {
+    typed->scan().metering.statistics_unavailable.fetch_add(1, std::memory_order_relaxed);
+    return unique_ptr<BaseStatistics>{nullptr};
+  };
   auto const& first_summary = typed->files().front().footer_summary;
-  if (!first_summary || column_index >= first_summary->types.size()) { return nullptr; }
+  if (!first_summary || column_index >= first_summary->types.size()) { return unavailable(); }
 
   bool all_null_free = true;
   for (auto const& file : typed->files()) {
@@ -483,10 +616,18 @@ unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext&,
   }
   std::optional<Value> minimum;
   std::optional<Value> maximum;
+  std::optional<std::vector<std::uint8_t>> string_minimum;
+  std::optional<std::vector<std::uint8_t>> string_maximum;
+  auto const is_string = first_summary->types[column_index].id() == LogicalTypeId::VARCHAR ||
+                         first_summary->types[column_index].id() == LogicalTypeId::BLOB;
   for (auto const& file : typed->files()) {
-    if (column_index >= file.footer_summary->column_minmax.size()) {
+    if (!file.footer_summary || column_index >= file.footer_summary->types.size() ||
+        file.footer_summary->types[column_index] != first_summary->types[column_index] ||
+        column_index >= file.footer_summary->column_minmax.size()) {
       minimum.reset();
       maximum.reset();
+      string_minimum.reset();
+      string_maximum.reset();
       break;
     }
     auto const& minmax = file.footer_summary->column_minmax[column_index];
@@ -496,8 +637,28 @@ unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext&,
       break;
     }
     for (std::size_t i = 0; i < minmax.min_values.size(); ++i) {
-      auto min = decode_exact_parquet_stat(minmax.min_values[i], first_summary->types[column_index]);
-      auto max = decode_exact_parquet_stat(minmax.max_values[i], first_summary->types[column_index]);
+      if (is_string) {
+        auto const& min_bytes = minmax.min_values[i];
+        auto const& max_bytes = minmax.max_values[i];
+        if (!exact_string_stat(min_bytes, first_summary->types[column_index]) ||
+            !exact_string_stat(max_bytes, first_summary->types[column_index]) ||
+            compare_parquet_bytes(max_bytes, min_bytes) < 0) {
+          string_minimum.reset();
+          string_maximum.reset();
+          break;
+        }
+        if (!string_minimum || compare_parquet_bytes(min_bytes, *string_minimum) < 0) {
+          string_minimum = min_bytes;
+        }
+        if (!string_maximum || compare_parquet_bytes(*string_maximum, max_bytes) < 0) {
+          string_maximum = max_bytes;
+        }
+        continue;
+      }
+      auto min = decode_exact_parquet_stat(
+        minmax.min_values[i], first_summary->types[column_index], minmax.encoding, minmax.time_unit);
+      auto max = decode_exact_parquet_stat(
+        minmax.max_values[i], first_summary->types[column_index], minmax.encoding, minmax.time_unit);
       if (!min || !max || ValueOperations::LessThan(*max, *min)) {
         minimum.reset();
         maximum.reset();
@@ -506,16 +667,31 @@ unique_ptr<BaseStatistics> SiriusReadParquetStatistics(ClientContext&,
       if (!minimum || ValueOperations::LessThan(*min, *minimum)) { minimum = std::move(min); }
       if (!maximum || ValueOperations::LessThan(*maximum, *max)) { maximum = std::move(max); }
     }
-    if (!minimum || !maximum) { break; }
+    if ((is_string && (!string_minimum || !string_maximum)) ||
+        (!is_string && (!minimum || !maximum))) { break; }
   }
 
-  if (!all_null_free && (!minimum || !maximum)) { return nullptr; }
+  if (!all_null_free && ((is_string && (!string_minimum || !string_maximum)) ||
+                         (!is_string && (!minimum || !maximum)))) {
+    return unavailable();
+  }
 
-  auto result = NumericStats::CreateUnknown(first_summary->types[column_index]);
+  auto result = is_string ? StringStats::CreateUnknown(first_summary->types[column_index])
+                          : NumericStats::CreateUnknown(first_summary->types[column_index]);
   if (all_null_free) { result.Set(StatsInfo::CANNOT_HAVE_NULL_VALUES); }
-  if (minimum && maximum) {
+  if (is_string && string_minimum && string_maximum) {
+    auto min = std::string(reinterpret_cast<char const*>(string_minimum->data()), string_minimum->size());
+    auto max = std::string(reinterpret_cast<char const*>(string_maximum->data()), string_maximum->size());
+    StringStats::SetMin(result, min);
+    StringStats::SetMax(result, max);
+  } else if (minimum && maximum) {
     NumericStats::SetMin(result, *minimum);
     NumericStats::SetMax(result, *maximum);
+  }
+  if ((is_string && string_minimum && string_maximum) || (!is_string && minimum && maximum)) {
+    typed->scan().metering.statistics_with_minmax.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    typed->scan().metering.statistics_nullability_only.fetch_add(1, std::memory_order_relaxed);
   }
   return result.ToUnique();
 }

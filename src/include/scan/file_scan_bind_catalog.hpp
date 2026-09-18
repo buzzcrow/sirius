@@ -18,6 +18,16 @@
 
 namespace sirius::scan {
 
+/// Snapshot of connection-local bind ownership. Counts describe references
+/// held by this catalog only; copies and physical consumers keep their own
+/// shared ownership and are intentionally not inferred here.
+struct file_scan_bind_lifecycle_data {
+  uint64_t active_generation{0};
+  std::size_t active_bindings{0};
+  uint64_t bindings_registered{0};
+  uint64_t catalog_references_released{0};
+};
+
 /// Per-connection, generation-scoped ownership for Sirius-owned file binds.
 /// It exists solely to let LogicalGet serialization recover the exact bind
 /// object during an in-process plan copy; it is not a persistent plan format.
@@ -37,11 +47,16 @@ class file_scan_bind_catalog final : public duckdb::ClientContextState {
     uint64_t scan_instance_id,
     uint64_t fingerprint) const;
 
+  /// Read-only lifecycle evidence for tests and connection-level telemetry.
+  [[nodiscard]] file_scan_bind_lifecycle_data lifecycle_data() const;
+
  private:
   mutable std::mutex mutex_;
   uint64_t active_generation_{0};
   uint64_t next_scan_instance_id_{0};
   uint64_t next_fingerprint_{0};
+  uint64_t bindings_registered_{0};
+  uint64_t catalog_references_released_{0};
   std::unordered_map<uint64_t, std::shared_ptr<duckdb::SiriusParquetBoundScan const>> entries_;
 };
 

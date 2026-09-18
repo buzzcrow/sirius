@@ -24,6 +24,7 @@ file_scan_bind_catalog::register_parquet_scan(
   if (active_generation_ != generation) {
     // The registry drops only its own references. Existing logical/physical
     // consumers keep their immutable shared binding alive until they finish.
+    catalog_references_released_ += entries_.size();
     entries_.clear();
     active_generation_ = generation;
   }
@@ -34,7 +35,14 @@ file_scan_bind_catalog::register_parquet_scan(
   mutable_bound->fingerprint      = ++next_fingerprint_;
   std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound = std::move(mutable_bound);
   entries_.emplace(bound->scan_instance_id, bound);
+  ++bindings_registered_;
   return bound;
+}
+
+file_scan_bind_lifecycle_data file_scan_bind_catalog::lifecycle_data() const
+{
+  std::lock_guard lock(mutex_);
+  return {active_generation_, entries_.size(), bindings_registered_, catalog_references_released_};
 }
 
 std::shared_ptr<duckdb::SiriusParquetBoundScan const>

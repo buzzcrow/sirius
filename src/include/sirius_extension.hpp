@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -74,6 +75,192 @@ struct SiriusParquetFileBindData {
   }
 };
 
+/// Per immutable bind counters. They deliberately live with the bound scan,
+/// rather than in connection-global state, so plan copies and deserialized
+/// references report one coherent view without extending object lifetime.
+struct SiriusParquetMeteringData {
+  uint64_t binds_created{0};
+  uint64_t bound_files{0};
+  uint64_t footer_summaries{0};
+  uint64_t footer_row_groups{0};
+  uint64_t footer_compressed_bytes{0};
+  uint64_t footer_uncompressed_bytes{0};
+  uint64_t null_count_covered_columns{0};
+  uint64_t minmax_covered_columns{0};
+  uint64_t cardinality_requests{0};
+  uint64_t statistics_requests{0};
+  uint64_t statistics_with_minmax{0};
+  uint64_t statistics_nullability_only{0};
+  uint64_t statistics_unavailable{0};
+  uint64_t planned_row_groups{0};
+  uint64_t planned_compressed_read_bytes{0};
+  uint64_t planned_decode_working_bytes{0};
+  uint64_t materialization_attempts{0};
+  uint64_t materialization_successes{0};
+  uint64_t materialization_failures{0};
+  uint64_t materialized_row_groups{0};
+  uint64_t materialized_compressed_read_budget_bytes{0};
+  uint64_t materialized_decode_working_budget_bytes{0};
+  uint64_t materialized_rows{0};
+  uint64_t pipeline_task_attempts{0};
+  uint64_t pipeline_task_successes{0};
+  uint64_t pipeline_task_failures{0};
+  uint64_t pipeline_task_input_basis_bytes{0};
+  uint64_t pipeline_task_reservation_bytes{0};
+  uint64_t pipeline_task_peak_operator_bytes{0};
+  uint64_t pipeline_task_output_bytes{0};
+};
+
+class SiriusParquetMetering {
+ public:
+  void record_bind(std::vector<SiriusParquetFileBindData> const& files)
+  {
+    binds_created.fetch_add(1, std::memory_order_relaxed);
+    bound_files.fetch_add(files.size(), std::memory_order_relaxed);
+    for (auto const& file : files) {
+      if (!file.footer_summary) { continue; }
+      footer_summaries.fetch_add(1, std::memory_order_relaxed);
+      for (auto const& row_group : file.footer_summary->row_groups) {
+        footer_row_groups.fetch_add(1, std::memory_order_relaxed);
+        footer_compressed_bytes.fetch_add(row_group.compressed_bytes, std::memory_order_relaxed);
+        footer_uncompressed_bytes.fetch_add(row_group.uncompressed_bytes, std::memory_order_relaxed);
+      }
+      for (auto const& summary : file.footer_summary->column_null_counts) {
+        if (summary.complete) { null_count_covered_columns.fetch_add(1, std::memory_order_relaxed); }
+      }
+      for (auto const& summary : file.footer_summary->column_minmax) {
+        if (summary.complete) { minmax_covered_columns.fetch_add(1, std::memory_order_relaxed); }
+      }
+    }
+  }
+
+  [[nodiscard]] SiriusParquetMeteringData snapshot() const noexcept
+  {
+    SiriusParquetMeteringData result;
+    result.binds_created              = binds_created.load(std::memory_order_relaxed);
+    result.bound_files                = bound_files.load(std::memory_order_relaxed);
+    result.footer_summaries           = footer_summaries.load(std::memory_order_relaxed);
+    result.footer_row_groups          = footer_row_groups.load(std::memory_order_relaxed);
+    result.footer_compressed_bytes    = footer_compressed_bytes.load(std::memory_order_relaxed);
+    result.footer_uncompressed_bytes  = footer_uncompressed_bytes.load(std::memory_order_relaxed);
+    result.null_count_covered_columns = null_count_covered_columns.load(std::memory_order_relaxed);
+    result.minmax_covered_columns     = minmax_covered_columns.load(std::memory_order_relaxed);
+    result.cardinality_requests       = cardinality_requests.load(std::memory_order_relaxed);
+    result.statistics_requests        = statistics_requests.load(std::memory_order_relaxed);
+    result.statistics_with_minmax     = statistics_with_minmax.load(std::memory_order_relaxed);
+    result.statistics_nullability_only =
+      statistics_nullability_only.load(std::memory_order_relaxed);
+    result.statistics_unavailable = statistics_unavailable.load(std::memory_order_relaxed);
+    result.planned_row_groups = planned_row_groups.load(std::memory_order_relaxed);
+    result.planned_compressed_read_bytes =
+      planned_compressed_read_bytes.load(std::memory_order_relaxed);
+    result.planned_decode_working_bytes =
+      planned_decode_working_bytes.load(std::memory_order_relaxed);
+    result.materialization_attempts = materialization_attempts.load(std::memory_order_relaxed);
+    result.materialization_successes = materialization_successes.load(std::memory_order_relaxed);
+    result.materialization_failures = materialization_failures.load(std::memory_order_relaxed);
+    result.materialized_row_groups = materialized_row_groups.load(std::memory_order_relaxed);
+    result.materialized_compressed_read_budget_bytes =
+      materialized_compressed_read_budget_bytes.load(std::memory_order_relaxed);
+    result.materialized_decode_working_budget_bytes =
+      materialized_decode_working_budget_bytes.load(std::memory_order_relaxed);
+    result.materialized_rows = materialized_rows.load(std::memory_order_relaxed);
+    result.pipeline_task_attempts = pipeline_task_attempts.load(std::memory_order_relaxed);
+    result.pipeline_task_successes = pipeline_task_successes.load(std::memory_order_relaxed);
+    result.pipeline_task_failures = pipeline_task_failures.load(std::memory_order_relaxed);
+    result.pipeline_task_input_basis_bytes =
+      pipeline_task_input_basis_bytes.load(std::memory_order_relaxed);
+    result.pipeline_task_reservation_bytes =
+      pipeline_task_reservation_bytes.load(std::memory_order_relaxed);
+    result.pipeline_task_peak_operator_bytes =
+      pipeline_task_peak_operator_bytes.load(std::memory_order_relaxed);
+    result.pipeline_task_output_bytes = pipeline_task_output_bytes.load(std::memory_order_relaxed);
+    return result;
+  }
+
+  /// Runtime scan observation. The byte values are the split's conservative
+  /// reader budgets, not reactor-reported physical I/O bytes: cache and
+  /// aligned backend reads make the latter backend-specific.
+  void record_materialization_attempt(uint64_t row_groups,
+                                      uint64_t compressed_read_budget_bytes,
+                                      uint64_t decode_working_budget_bytes) const noexcept
+  {
+    materialization_attempts.fetch_add(1, std::memory_order_relaxed);
+    materialized_row_groups.fetch_add(row_groups, std::memory_order_relaxed);
+    materialized_compressed_read_budget_bytes.fetch_add(
+      compressed_read_budget_bytes, std::memory_order_relaxed);
+    materialized_decode_working_budget_bytes.fetch_add(
+      decode_working_budget_bytes, std::memory_order_relaxed);
+  }
+
+  void record_materialization_success(uint64_t rows) const noexcept
+  {
+    materialization_successes.fetch_add(1, std::memory_order_relaxed);
+    materialized_rows.fetch_add(rows, std::memory_order_relaxed);
+  }
+
+  void record_materialization_failure() const noexcept
+  {
+    materialization_failures.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /// Task-level observation is attributed only when the task input carries
+  /// this immutable BoundScan. @p peak_operator_bytes uses the same
+  /// materialization-excluded definition as pipeline_memory_history; it is
+  /// not a process-wide GPU usage sample and never influences reservation.
+  void record_pipeline_task_attempt(uint64_t input_basis_bytes, uint64_t reservation_bytes) const noexcept
+  {
+    pipeline_task_attempts.fetch_add(1, std::memory_order_relaxed);
+    pipeline_task_input_basis_bytes.fetch_add(input_basis_bytes, std::memory_order_relaxed);
+    pipeline_task_reservation_bytes.fetch_add(reservation_bytes, std::memory_order_relaxed);
+  }
+
+  void record_pipeline_task_success(uint64_t peak_operator_bytes, uint64_t output_bytes) const noexcept
+  {
+    pipeline_task_successes.fetch_add(1, std::memory_order_relaxed);
+    pipeline_task_peak_operator_bytes.fetch_add(peak_operator_bytes, std::memory_order_relaxed);
+    pipeline_task_output_bytes.fetch_add(output_bytes, std::memory_order_relaxed);
+  }
+
+  void record_pipeline_task_failure() const noexcept
+  {
+    pipeline_task_failures.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  mutable std::atomic<uint64_t> binds_created{0};
+  mutable std::atomic<uint64_t> bound_files{0};
+  mutable std::atomic<uint64_t> footer_summaries{0};
+  mutable std::atomic<uint64_t> footer_row_groups{0};
+  mutable std::atomic<uint64_t> footer_compressed_bytes{0};
+  mutable std::atomic<uint64_t> footer_uncompressed_bytes{0};
+  mutable std::atomic<uint64_t> null_count_covered_columns{0};
+  mutable std::atomic<uint64_t> minmax_covered_columns{0};
+  mutable std::atomic<uint64_t> cardinality_requests{0};
+  mutable std::atomic<uint64_t> statistics_requests{0};
+  mutable std::atomic<uint64_t> statistics_with_minmax{0};
+  mutable std::atomic<uint64_t> statistics_nullability_only{0};
+  mutable std::atomic<uint64_t> statistics_unavailable{0};
+  /// Scan-plan facts after footer/statistics pruning. These are observational:
+  /// they never feed admission, split selection, or the optimizer.
+  mutable std::atomic<uint64_t> planned_row_groups{0};
+  mutable std::atomic<uint64_t> planned_compressed_read_bytes{0};
+  mutable std::atomic<uint64_t> planned_decode_working_bytes{0};
+  mutable std::atomic<uint64_t> materialization_attempts{0};
+  mutable std::atomic<uint64_t> materialization_successes{0};
+  mutable std::atomic<uint64_t> materialization_failures{0};
+  mutable std::atomic<uint64_t> materialized_row_groups{0};
+  mutable std::atomic<uint64_t> materialized_compressed_read_budget_bytes{0};
+  mutable std::atomic<uint64_t> materialized_decode_working_budget_bytes{0};
+  mutable std::atomic<uint64_t> materialized_rows{0};
+  mutable std::atomic<uint64_t> pipeline_task_attempts{0};
+  mutable std::atomic<uint64_t> pipeline_task_successes{0};
+  mutable std::atomic<uint64_t> pipeline_task_failures{0};
+  mutable std::atomic<uint64_t> pipeline_task_input_basis_bytes{0};
+  mutable std::atomic<uint64_t> pipeline_task_reservation_bytes{0};
+  mutable std::atomic<uint64_t> pipeline_task_peak_operator_bytes{0};
+  mutable std::atomic<uint64_t> pipeline_task_output_bytes{0};
+};
+
 /// Immutable, connection-generation-local result of a Sirius-owned Parquet
 /// bind.  A logical-plan copy must retain this object rather than copy its
 /// parsed footer payload or bind the URI again.
@@ -82,6 +269,7 @@ struct SiriusParquetBoundScan {
   SiriusParquetBoundScan(std::vector<SiriusParquetFileBindData> files, std::size_t total_num_rows)
     : files(std::move(files)), total_num_rows(total_num_rows)
   {
+    metering.record_bind(this->files);
   }
 
   uint64_t generation{0};
@@ -89,6 +277,7 @@ struct SiriusParquetBoundScan {
   uint64_t fingerprint{0};
   std::vector<SiriusParquetFileBindData> files;
   std::size_t total_num_rows{0};
+  mutable SiriusParquetMetering metering;
 };
 
 // Lightweight table-function payload for a Sirius-owned Parquet scan. The
@@ -130,6 +319,7 @@ struct SiriusReadParquetBindData : public FunctionData {
   [[nodiscard]] uint64_t generation() const { return scan().generation; }
   [[nodiscard]] uint64_t scan_instance_id() const { return scan().scan_instance_id; }
   [[nodiscard]] uint64_t fingerprint() const { return scan().fingerprint; }
+  [[nodiscard]] SiriusParquetMeteringData metering() const { return scan().metering.snapshot(); }
 
   // One-file accessors preserve the old compatibility surface without making a
   // second copy of the footer evidence. Callers for multi-file scans use files().

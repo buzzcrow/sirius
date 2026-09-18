@@ -112,7 +112,17 @@ class prefetching_handle::prefetch_lifecycle_manager {
     if (!_ctx) { return; }
     prefetching_handle_state expected = prefetching_handle_state::idle;
     if (_user_state->compare_exchange_strong(expected, prefetching_handle_state::active)) {
-      if (_ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(_ctx); }
+      // fadvise() hands preparation to another worker.  A just-in-time
+      // consumer may activate its handle before that worker has allocated the
+      // chunks; defer enqueueing in that case.  prepare_loop observes the
+      // active state after allocation and performs the one transition to
+      // loading.  Without this guard, prefetch_loop could consume an empty
+      // chunk list and silently drop the request.
+      if (_ctx &&
+          _prefetching_state->get_state() == entry_state::allocated &&
+          _prefetching_state->mark_loading()) {
+        _prefetch_queue.enqueue(_ctx);
+      }
     }
   }
 
@@ -728,15 +738,20 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     std::ignore = req->state->mark_allocated();
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time ||
         _io_ctx->preferred_prefetching_stage() == prefetching_stage::none) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
-      // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
-      // read() path handle the IO directly into the caller's buffer.
+      // buffers for multiple reads.  In either case, we can skip the prefetching step and let
+      // the read() path handle the IO directly into the caller's buffer.
       continue;
     }
 
-    if (req->is_active() && !st.stop_requested()) { _prefetch_queue.enqueue(std::move(req)); }
+    // For just-in-time backends this is the matching half of activate(): an
+    // activation that raced ahead of allocation becomes runnable here.  The
+    // state transition makes the hand-off exactly once if activation races
+    // with this branch after allocation.
+    if (req->is_active() && !st.stop_requested() && req->state->mark_loading()) {
+      _prefetch_queue.enqueue(std::move(req));
+    }
   }
 }
 

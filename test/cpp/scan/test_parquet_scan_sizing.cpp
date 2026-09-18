@@ -21,6 +21,7 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <sirius_extension.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <algorithm>
@@ -306,6 +307,26 @@ std::vector<std::unique_ptr<scan::scan_info>> coalesce_files(
   }
   append(coalescer->flush());
   return splits;
+}
+
+std::shared_ptr<sirius::scan::parquet_footer_summary> footer_summary_for(
+  cudf::io::parquet::FileMetaData const& metadata)
+{
+  auto summary = std::make_shared<sirius::scan::parquet_footer_summary>();
+  std::uint64_t first_row = 0;
+  for (auto const& row_group : metadata.row_groups) {
+    std::uint64_t compressed   = 0;
+    std::uint64_t uncompressed = 0;
+    for (auto const& column : row_group.columns) {
+      compressed += static_cast<std::uint64_t>(column.meta_data.total_compressed_size);
+      uncompressed += static_cast<std::uint64_t>(column.meta_data.total_uncompressed_size);
+    }
+    auto const rows = static_cast<std::uint64_t>(row_group.num_rows);
+    summary->row_groups.push_back({first_row, rows, compressed, uncompressed});
+    first_row += rows;
+  }
+  summary->total_num_rows = first_row;
+  return summary;
 }
 
 void check_partition_byte_delta(scan::parquet_file_scan_info const& actual,
@@ -661,6 +682,65 @@ TEST_CASE_METHOD(carrier_file_fixture,
     CHECK(group.decode_working_bytes > 0);
     CHECK(group.compressed_bytes > 0);
   }
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "bound parquet footer guards projected row-group read and memory estimates",
+                 "[scan][parquet][sizing][bound-footer]")
+{
+  auto baseline_reader = scan::make_ingestible(make_info({"a"}));
+  auto baseline        = read_file(*baseline_reader);
+  auto const metadata  = baseline->file_metadata;
+  REQUIRE(metadata);
+  auto footer_summary = footer_summary_for(*metadata);
+  REQUIRE(footer_summary->row_groups.size() == baseline->row_groups.size());
+
+  auto info = make_info({"a"});
+  auto bound = std::make_shared<duckdb::SiriusParquetBoundScan>(
+    std::vector<duckdb::SiriusParquetFileBindData>{{path("a"),
+                                                     metadata,
+                                                     static_cast<std::size_t>(std::filesystem::file_size(path("a"))),
+                                                     {},
+                                                     {},
+                                                     footer_summary}},
+    static_cast<std::size_t>(footer_summary->total_num_rows));
+  bound->generation       = 17;
+  bound->scan_instance_id = 99;
+  info->bound_scan        = bound;
+  info->scan_instance_id  = bound->scan_instance_id;
+  info->bound_files.push_back(
+    {metadata, footer_summary, static_cast<std::size_t>(std::filesystem::file_size(path("a"))), {}, {}});
+
+  auto bound_reader = scan::make_ingestible(std::move(info));
+  auto actual       = read_file(*bound_reader);
+  CHECK(actual->file_metadata == metadata);
+  REQUIRE(actual->row_groups.size() == baseline->row_groups.size());
+  std::size_t planned_compressed = 0;
+  std::size_t planned_working    = 0;
+  for (std::size_t i = 0; i < actual->row_groups.size(); ++i) {
+    auto const& expected = baseline->row_groups[i];
+    auto const& group    = actual->row_groups[i];
+    CAPTURE(i, group.num_rows);
+    CHECK(group.index == expected.index);
+    CHECK(group.compressed_bytes >= expected.compressed_bytes);
+    CHECK(group.decode_working_bytes >= expected.decode_working_bytes);
+    planned_compressed += group.compressed_bytes;
+    planned_working += group.decode_working_bytes;
+  }
+  auto const metering = bound->metering.snapshot();
+  CHECK(metering.planned_row_groups == actual->row_groups.size());
+  CHECK(metering.planned_compressed_read_bytes == planned_compressed);
+  CHECK(metering.planned_decode_working_bytes == planned_working);
+
+  std::vector<std::unique_ptr<scan::parquet_file_scan_info>> files;
+  files.push_back(std::move(actual));
+  auto splits = coalesce_files(*bound_reader, std::move(files));
+  REQUIRE(splits.size() == 1);
+  auto const* split = dynamic_cast<scan::parquet_split_info const*>(splits.front().get());
+  REQUIRE(split);
+  CHECK(split->bound_scan == bound);
+  CHECK(split->generation == 17);
+  CHECK(split->scan_instance_id == 99);
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,

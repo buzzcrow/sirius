@@ -30,6 +30,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -120,6 +122,13 @@ fs::path parquet_fixture(std::string_view file_name)
 {
   return fs::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" / "parquet" /
          file_name;
+}
+
+std::vector<std::uint8_t> read_file_bytes(fs::path const& path)
+{
+  std::ifstream input(path, std::ios::binary);
+  REQUIRE(input.is_open());
+  return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
 struct duckdb_parquet_bind_shape {
@@ -285,6 +294,82 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
   }
 }
 
+TEST_CASE("describe_parquet retains proven local temporal footer units",
+          "[scan_manager][describe_parquet][temporal]")
+{
+  scan_manager_fixture fixture;
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
+
+  auto const path = fs::temp_directory_path() / "sirius_describe_parquet_temporal_stats.parquet";
+  std::error_code ec;
+  fs::remove(path, ec);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto create = con.Query(
+    "CREATE TABLE temporal_stats AS SELECT TIME '00:00:01.000001' AS t, "
+    "TIMESTAMP '2024-01-01 00:00:01.000001' AS ts UNION ALL "
+    "SELECT TIME '00:00:02.000002', TIMESTAMP '2024-01-01 00:00:02.000002'");
+  REQUIRE(create);
+  REQUIRE_FALSE(create->HasError());
+  auto copy = con.Query("COPY temporal_stats TO " + sql_quote(path.string()) + " (FORMAT PARQUET)");
+  REQUIRE(copy);
+  REQUIRE_FALSE(copy->HasError());
+
+  auto const bind = manager.describe_parquet("file://" + path.string());
+  REQUIRE(bind.footer_summary);
+  REQUIRE(bind.footer_summary->names.size() == 2);
+  REQUIRE(bind.footer_summary->column_minmax.size() == 2);
+  for (auto const& summary : bind.footer_summary->column_minmax) {
+    CHECK(summary.complete);
+    CHECK(summary.time_unit == sirius::scan::parquet_stat_time_unit::micros);
+    REQUIRE(summary.min_values.size() == 1);
+    REQUIRE(summary.max_values.size() == 1);
+    CHECK(summary.min_values.front().size() == sizeof(std::int64_t));
+    CHECK(summary.max_values.front().size() == sizeof(std::int64_t));
+  }
+
+  fs::remove(path, ec);
+}
+
+TEST_CASE("describe_parquet retains decimal128 FLBA statistics only with schema proof",
+          "[scan_manager][describe_parquet][decimal]")
+{
+  scan_manager_fixture fixture;
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
+
+  auto const path = fs::temp_directory_path() / "sirius_describe_parquet_decimal128_stats.parquet";
+  std::error_code ec;
+  fs::remove(path, ec);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto copy = con.Query(
+    "COPY (SELECT CAST(-1 AS DECIMAL(38, 4)) AS d "
+    "UNION ALL SELECT CAST(18446744073709551616 AS DECIMAL(38, 4))) TO " +
+    sql_quote(path.string()) + " (FORMAT PARQUET)");
+  REQUIRE(copy);
+  REQUIRE_FALSE(copy->HasError());
+
+  auto const bind = manager.describe_parquet("file://" + path.string());
+  REQUIRE(bind.footer_summary);
+  REQUIRE(bind.footer_summary->types == std::vector<duckdb::LogicalType>{duckdb::LogicalType::DECIMAL(38, 4)});
+  REQUIRE(bind.footer_summary->column_minmax.size() == 1);
+  auto const& summary = bind.footer_summary->column_minmax.front();
+  REQUIRE(summary.complete);
+  CHECK(summary.encoding == sirius::scan::parquet_minmax_encoding::big_endian_decimal);
+  REQUIRE(summary.min_values.size() == 1);
+  REQUIRE(summary.max_values.size() == 1);
+  CHECK(summary.min_values.front().size() == 16);
+  CHECK(summary.max_values.front().size() == 16);
+
+  fs::remove(path, ec);
+}
+
 TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU read_parquet",
           "[s3][integration][describe_parquet][nested]")
 {
@@ -378,9 +463,65 @@ TEST_CASE("describe_parquet reuses the metadata store on repeated S3 binds",
 
   std::uint64_t warm_gets = 0;
   auto warm               = describe_with_counter(manager, uri, warm_gets);
-  CHECK(warm_gets == 0);
+  // Each bind obtains one footer Range GET to validate its object version;
+  // matching versions reuse the already-parsed metadata, with no HEAD.
+  CHECK(warm_gets == 1);
   require_same_bind_result(cold, warm);
   CHECK(cold.file_metadata == warm.file_metadata);
+}
+
+TEST_CASE("describe_parquet isolates a MinIO same-key overwrite in the next bind generation",
+          "[s3][integration][describe_parquet][version]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const key    = std::string{"parquet/e1-same-key-overwrite.parquet"};
+  auto const uri    = "s3://" + bucket + "/" + key;
+  auto const root   = fs::temp_directory_path();
+  auto const first_path  = root / "sirius_e1_overwrite_v1.parquet";
+  auto const second_path = root / "sirius_e1_overwrite_v2.parquet";
+  std::error_code ec;
+  fs::remove(first_path, ec);
+  fs::remove(second_path, ec);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto write = [&](fs::path const& path, std::string const& query) {
+    auto result = con.Query("COPY (" + query + ") TO " + sql_quote(path.string()) + " (FORMAT PARQUET)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  };
+  write(first_path, "SELECT 1::INTEGER AS generation_marker");
+  write(second_path, "SELECT i::INTEGER AS generation_marker FROM range(2) AS t(i)");
+
+  // This helper intentionally refuses external endpoints: an overwrite test
+  // must not mutate a user-provided S3 bucket.
+  if (!sirius::test::put_s3_container_object(key, read_file_bytes(first_path))) {
+    fs::remove(first_path, ec);
+    fs::remove(second_path, ec);
+    SUCCEED("managed MinIO is required for same-key overwrite coverage");
+    return;
+  }
+
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  auto first = manager.describe_parquet(uri);
+  REQUIRE(first.file_metadata);
+  REQUIRE(first.total_num_rows == 1);
+  auto const old_footer = first.file_metadata;
+
+  REQUIRE(sirius::test::put_s3_container_object(key, read_file_bytes(second_path)));
+  auto second = manager.describe_parquet(uri);
+  REQUIRE(second.file_metadata);
+  CHECK(second.total_num_rows == 2);
+  CHECK(second.file_metadata != old_footer);
+  // The original binding is immutable: retiring its store entry cannot change
+  // what an already-bound query holds.
+  CHECK(old_footer->num_rows == 1);
+
+  fs::remove(first_path, ec);
+  fs::remove(second_path, ec);
 }
 
 TEST_CASE("describe_parquet footer fetch stays bounded for small and larger S3 parquet objects",

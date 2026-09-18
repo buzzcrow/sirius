@@ -1499,11 +1499,16 @@ TEST_CASE("metadata store retires an older version without invalidating its read
   rest_io_object v2{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v2\""};
   auto old = std::make_shared<metadata>();
   store.register_metadata(v1, old);
+  // This models an already-bound query. Its reader retains the metadata even
+  // after the store releases its reference while advancing to a new version.
+  auto reader = store.get_metadata(v1);
+  REQUIRE(reader == old);
   store.register_metadata(v2, std::make_shared<metadata>());
 
   CHECK(store.size() == 1);
   CHECK(store.get_metadata(v1) == nullptr);
   CHECK(store.get_metadata(v2) != nullptr);
+  CHECK(reader == old);
   CHECK(old != nullptr);
 }
 
@@ -1545,6 +1550,48 @@ TEST_CASE("rest range reads validate a bound ETag without HEAD", "[s3][integrati
     }
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("rest retries a bound range read without losing its ETag generation",
+          "[s3][integration][rest][etag][retry]")
+{
+  auto const payload = deterministic_payload(4096);
+
+  SECTION("retry with the bound version succeeds")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets      = 1;
+    fault.fail_status          = 503;
+    fault.successful_get_etag  = "\"v1\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/retry-etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK(datasource->host_read(0, out.size(), out.data()) == out.size());
+    CHECK(out == payload);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("retry that observes a new version fails instead of mixing generations")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets      = 1;
+    fault.fail_status          = 503;
+    fault.successful_get_etag  = "\"v2\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/retry-etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK_THROWS_WITH(datasource->host_read(0, out.size(), out.data()),
+                      Catch::Matchers::Contains("S3 version conflict"));
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
   }
 }
 
@@ -1750,8 +1797,11 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   CHECK(second.object_size == result.object_size);
   CHECK(second.total_num_rows == result.total_num_rows);
   CHECK(second.names == result.names);
-  CHECK(server.head_count() == 1);
-  CHECK(server.get_count() == 1);
+  // A rebind validates the object with a footer Range GET.  This catches a
+  // same-key overwrite without an extra HEAD. This fake range server provides
+  // no stable ETag, so it deliberately does not assert a versioned-cache hit.
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 2);
 }
 
 TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",

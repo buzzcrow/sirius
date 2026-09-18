@@ -1450,6 +1450,9 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
     bool minmax_complete  = true;
     std::uint64_t null_count = 0;
     auto const type_id = footer_summary->types[column_index].id();
+    // Keep only physical encodings that the optimizer callback can decode without
+    // consulting the mutable cuDF footer.  In particular, do not mistake an
+    // arbitrary BYTE_ARRAY (or a decimal FLBA of the wrong width) for a scalar.
     auto const minmax_supported = type_id == duckdb::LogicalTypeId::BOOLEAN ||
                                   type_id == duckdb::LogicalTypeId::TINYINT ||
                                   type_id == duckdb::LogicalTypeId::SMALLINT ||
@@ -1458,16 +1461,149 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
                                   type_id == duckdb::LogicalTypeId::UTINYINT ||
                                   type_id == duckdb::LogicalTypeId::USMALLINT ||
                                   type_id == duckdb::LogicalTypeId::UINTEGER ||
-                                  type_id == duckdb::LogicalTypeId::UBIGINT;
+                                  type_id == duckdb::LogicalTypeId::UBIGINT ||
+                                  type_id == duckdb::LogicalTypeId::FLOAT ||
+                                  type_id == duckdb::LogicalTypeId::DOUBLE ||
+                                  type_id == duckdb::LogicalTypeId::DATE ||
+                                  type_id == duckdb::LogicalTypeId::TIME ||
+                                  type_id == duckdb::LogicalTypeId::TIMESTAMP ||
+                                  type_id == duckdb::LogicalTypeId::DECIMAL ||
+                                  type_id == duckdb::LogicalTypeId::VARCHAR ||
+                                  type_id == duckdb::LogicalTypeId::BLOB ||
+                                  type_id == duckdb::LogicalTypeId::UUID;
     auto const expected_size = type_id == duckdb::LogicalTypeId::BOOLEAN ? 1U :
                                (type_id == duckdb::LogicalTypeId::BIGINT ||
                                 type_id == duckdb::LogicalTypeId::UBIGINT)
                                  ? 8U
                                  : 4U;
-    auto const expected_physical = type_id == duckdb::LogicalTypeId::BOOLEAN
-                                     ? cudf::io::parquet::Type::BOOLEAN
-                                     : (expected_size == 8U ? cudf::io::parquet::Type::INT64
-                                                            : cudf::io::parquet::Type::INT32);
+    // A row-group chunk only names its schema path. Resolve this top-level,
+    // scalar leaf in the parsed footer before considering byte-array DECIMAL
+    // statistics.  A LogicalType::DECIMAL alone is not proof that arbitrary
+    // BYTE_ARRAY bytes use Parquet's signed big-endian decimal encoding.
+    auto const top_level_schema_leaf = [&]() -> cudf::io::parquet::SchemaElement const* {
+      if (file_metadata->schema.empty()) { return nullptr; }
+      auto const& root = file_metadata->schema.front();
+      std::size_t schema_index = 1;
+      for (int child = 0; child < root.num_children; ++child) {
+        if (schema_index >= file_metadata->schema.size()) { return nullptr; }
+        auto const& element = file_metadata->schema[schema_index];
+        if (element.name == footer_summary->names[column_index]) {
+          return element.num_children == 0 ? &element : nullptr;
+        }
+        // The footer schema is preorder-flattened. Skip exactly this child's
+        // subtree so repeated nested child names cannot be mistaken for a
+        // top-level leaf.
+        int pending = 1;
+        while (pending > 0) {
+          if (schema_index >= file_metadata->schema.size()) { return nullptr; }
+          pending += file_metadata->schema[schema_index].num_children - 1;
+          ++schema_index;
+        }
+      }
+      return nullptr;
+    }();
+    auto const schema_declares_decimal = [](cudf::io::parquet::SchemaElement const& element) {
+      return (element.logical_type.has_value() &&
+              element.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL) ||
+             (element.converted_type.has_value() &&
+              *element.converted_type == cudf::io::parquet::ConvertedType::DECIMAL);
+    };
+    auto const byte_decimal = type_id == duckdb::LogicalTypeId::DECIMAL &&
+                              top_level_schema_leaf != nullptr &&
+                              schema_declares_decimal(*top_level_schema_leaf) &&
+                              (top_level_schema_leaf->type == cudf::io::parquet::Type::BYTE_ARRAY ||
+                               top_level_schema_leaf->type ==
+                                 cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY);
+    auto const temporal_unit = [&]() -> std::optional<sirius::scan::parquet_stat_time_unit> {
+      if (top_level_schema_leaf == nullptr) { return std::nullopt; }
+      auto const modern_unit = [](cudf::io::parquet::TimeUnit::Type unit)
+        -> std::optional<sirius::scan::parquet_stat_time_unit> {
+        switch (unit) {
+          case cudf::io::parquet::TimeUnit::MILLIS: return sirius::scan::parquet_stat_time_unit::millis;
+          case cudf::io::parquet::TimeUnit::MICROS: return sirius::scan::parquet_stat_time_unit::micros;
+          case cudf::io::parquet::TimeUnit::NANOS: return sirius::scan::parquet_stat_time_unit::nanos;
+          default: return std::nullopt;
+        }
+      };
+      auto const& leaf = *top_level_schema_leaf;
+      if (type_id == duckdb::LogicalTypeId::TIME) {
+        if (leaf.logical_type.has_value() && leaf.logical_type->type == cudf::io::parquet::LogicalType::TIME &&
+            leaf.logical_type->time_type.has_value()) {
+          return modern_unit(leaf.logical_type->time_type->unit.type);
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIME_MILLIS) {
+          return sirius::scan::parquet_stat_time_unit::millis;
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIME_MICROS) {
+          return sirius::scan::parquet_stat_time_unit::micros;
+        }
+      }
+      if (type_id == duckdb::LogicalTypeId::TIMESTAMP) {
+        if (leaf.logical_type.has_value() &&
+            leaf.logical_type->type == cudf::io::parquet::LogicalType::TIMESTAMP &&
+            leaf.logical_type->timestamp_type.has_value()) {
+          return modern_unit(leaf.logical_type->timestamp_type->unit.type);
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIMESTAMP_MILLIS) {
+          return sirius::scan::parquet_stat_time_unit::millis;
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIMESTAMP_MICROS) {
+          return sirius::scan::parquet_stat_time_unit::micros;
+        }
+      }
+      return std::nullopt;
+    }();
+    if (temporal_unit.has_value()) { minmax.time_unit = *temporal_unit; }
+    auto physical_and_size_match = [&](cudf::io::parquet::Type physical,
+                                       std::size_t size) {
+      if (type_id == duckdb::LogicalTypeId::FLOAT) {
+        return physical == cudf::io::parquet::Type::FLOAT && size == sizeof(float);
+      }
+      if (type_id == duckdb::LogicalTypeId::DOUBLE) {
+        return physical == cudf::io::parquet::Type::DOUBLE && size == sizeof(double);
+      }
+      if (type_id == duckdb::LogicalTypeId::VARCHAR || type_id == duckdb::LogicalTypeId::BLOB) {
+        return physical == cudf::io::parquet::Type::BYTE_ARRAY;
+      }
+      if (type_id == duckdb::LogicalTypeId::UUID) {
+        return physical == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY && size == 16;
+      }
+      if (type_id == duckdb::LogicalTypeId::DECIMAL) {
+        if ((physical == cudf::io::parquet::Type::INT32 && size == 4) ||
+            (physical == cudf::io::parquet::Type::INT64 && size == 8)) {
+          return true;
+        }
+        if (!byte_decimal || physical != top_level_schema_leaf->type || size == 0 ||
+            size > sizeof(duckdb::hugeint_t)) {
+          return false;
+        }
+        // BYTE_ARRAY carries its own length; FLBA must agree with the leaf
+        // declaration as well as staying inside DuckDB's decimal128 carrier.
+        return physical == cudf::io::parquet::Type::BYTE_ARRAY ||
+               (top_level_schema_leaf->type_length > 0 &&
+                size == static_cast<std::size_t>(top_level_schema_leaf->type_length));
+      }
+      if (type_id == duckdb::LogicalTypeId::TIME) {
+        return temporal_unit == sirius::scan::parquet_stat_time_unit::millis &&
+                 physical == cudf::io::parquet::Type::INT32 && size == sizeof(std::int32_t) ||
+               temporal_unit == sirius::scan::parquet_stat_time_unit::micros &&
+                 physical == cudf::io::parquet::Type::INT64 && size == sizeof(std::int64_t);
+      }
+      if (type_id == duckdb::LogicalTypeId::TIMESTAMP) {
+        return (temporal_unit == sirius::scan::parquet_stat_time_unit::millis ||
+                temporal_unit == sirius::scan::parquet_stat_time_unit::micros) &&
+               physical == cudf::io::parquet::Type::INT64 && size == sizeof(std::int64_t);
+      }
+      auto const expected = type_id == duckdb::LogicalTypeId::BOOLEAN
+                              ? cudf::io::parquet::Type::BOOLEAN
+                              : (expected_size == 8U ? cudf::io::parquet::Type::INT64
+                                                     : cudf::io::parquet::Type::INT32);
+      return physical == expected && size == expected_size;
+    };
     for (auto const& row_group : file_metadata->row_groups) {
       if (leaf_index >= row_group.columns.size()) {
         null_complete = false;
@@ -1488,10 +1624,11 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
           null_count += chunk_null_count;
         }
       }
-      if (!minmax_supported || chunk.meta_data.type != expected_physical || !stats.min_value ||
+      if (!minmax_supported || !stats.min_value ||
           !stats.max_value || !stats.is_min_value_exact || !*stats.is_min_value_exact ||
           !stats.is_max_value_exact || !*stats.is_max_value_exact ||
-          stats.min_value->size() != expected_size || stats.max_value->size() != expected_size) {
+          !physical_and_size_match(chunk.meta_data.type, stats.min_value->size()) ||
+          !physical_and_size_match(chunk.meta_data.type, stats.max_value->size())) {
         minmax_complete = false;
       } else {
         minmax.min_values.push_back(*stats.min_value);
@@ -1505,6 +1642,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
     if (!minmax.complete) {
       minmax.min_values.clear();
       minmax.max_values.clear();
+    } else if (byte_decimal) {
+      minmax.encoding = sirius::scan::parquet_minmax_encoding::big_endian_decimal;
     }
   }
 

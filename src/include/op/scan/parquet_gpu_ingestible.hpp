@@ -22,6 +22,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <scan/parquet_footer_summary.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -74,6 +75,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// for the independent DuckDB-bound compatibility path.
   struct bound_file {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> metadata;
+    std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary;
     std::size_t object_size{0};
     std::string validation_etag;
     sirius::io::local_file_version local_version;

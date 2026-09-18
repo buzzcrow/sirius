@@ -695,6 +695,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       "[parquet_gpu_ingestible] Sirius-owned scan lost its per-file bound footer record");
   }
   auto const& bound_file_metadata = bound_file ? bound_file->metadata : nullptr;
+  auto const& bound_footer_summary = bound_file ? bound_file->footer_summary : nullptr;
   std::shared_ptr<io::sirius_datasource> sirius_ds =
     bound_file
       ? io_ctx->open_datasource(file_path, bound_file->object_size, bound_file->validation_etag)
@@ -873,6 +874,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
     }
   }
+
+  // A column can appear both in a carrier and in a predicate. Count it once
+  // when scaling the bind-time row-group totals for a projection.
+  std::unordered_set<std::size_t> selected_leaf_indices(selected_chunk_indices.begin(),
+                                                         selected_chunk_indices.end());
 
   auto row_group_indices = reader.all_row_groups(opts);
   if (ast_expression && !disable_filter_pushdown) {
@@ -1084,10 +1090,36 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
     auto const estimate = rg_contribution(metadata.row_groups[rg_idx]);
+    auto guarded_estimate = estimate;
+    if (bound_footer_summary) {
+      auto const summary_index = static_cast<std::size_t>(rg_idx);
+      if (summary_index >= bound_footer_summary->row_groups.size() ||
+          bound_footer_summary->row_groups[summary_index].num_rows !=
+            static_cast<std::uint64_t>(metadata.row_groups[rg_idx].num_rows)) {
+        throw sirius::internal_exception(
+          "[parquet_gpu_ingestible] bound footer summary does not match its parsed footer");
+      }
+      auto const leaf_count = metadata.row_groups[rg_idx].columns.size();
+      auto const projected_leaf_count = file_projected ? selected_leaf_indices.size() : leaf_count;
+      auto const bound_estimate = sirius::scan::estimate_projected_row_group(
+        *bound_footer_summary, summary_index, projected_leaf_count, leaf_count);
+      guarded_estimate.compressed_bytes = std::max(
+        guarded_estimate.compressed_bytes, static_cast<std::size_t>(bound_estimate.compressed_read_bytes));
+      guarded_estimate.decode_working_bytes = std::max(
+        guarded_estimate.decode_working_bytes, static_cast<std::size_t>(bound_estimate.decoded_working_bytes));
+    }
+    if (_info->bound_scan) {
+      auto& metering = _info->bound_scan->metering;
+      metering.planned_row_groups.fetch_add(1, std::memory_order_relaxed);
+      metering.planned_compressed_read_bytes.fetch_add(
+        guarded_estimate.compressed_bytes, std::memory_order_relaxed);
+      metering.planned_decode_working_bytes.fetch_add(
+        guarded_estimate.decode_working_bytes, std::memory_order_relaxed);
+    }
     out->row_groups.push_back({rg_idx,
-                               estimate.output_bytes,
-                               estimate.decode_working_bytes,
-                               estimate.compressed_bytes,
+                               guarded_estimate.output_bytes,
+                               guarded_estimate.decode_working_bytes,
+                               guarded_estimate.compressed_bytes,
                                metadata.row_groups[rg_idx].num_rows});
   }
 
@@ -1205,9 +1237,41 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
+  // This is deliberately placed immediately around the cuDF reader rather
+  // than the asynchronous datasource/reactor layer. It reports each scan
+  // attempt and the exact split budgets consumed by that attempt, but makes no
+  // claim about physical backend bytes (which can include cache hits and
+  // alignment over-reads). The scope guard keeps failed reads visible without
+  // changing their exception behavior.
+  auto const* metering = split.bound_scan ? &split.bound_scan->metering : nullptr;
+  uint64_t materialized_row_groups = 0;
+  uint64_t compressed_read_budget  = 0;
+  uint64_t decode_working_budget   = 0;
+  for (auto const& slice : split.rg_slices) {
+    materialized_row_groups += slice.row_group_indices.size();
+    compressed_read_budget += slice.reserved_compressed_bytes;
+    decode_working_budget += slice.estimated_decode_working_bytes;
+  }
+  if (metering) {
+    metering->record_materialization_attempt(
+      materialized_row_groups, compressed_read_budget, decode_working_budget);
+  }
+  struct materialization_outcome {
+    duckdb::SiriusParquetMetering const* metering;
+    bool succeeded{false};
+    ~materialization_outcome()
+    {
+      if (metering && !succeeded) { metering->record_materialization_failure(); }
+    }
+  } outcome{metering};
+
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto [table, _] =
     cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+  if (metering) {
+    metering->record_materialization_success(static_cast<uint64_t>(table->num_rows()));
+  }
+  outcome.succeeded = true;
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared

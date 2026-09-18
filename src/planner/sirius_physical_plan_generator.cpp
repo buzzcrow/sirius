@@ -186,7 +186,11 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
           "Sirius-owned Parquet scan has an input without bound footer metadata");
       }
       info->bound_files.push_back(
-        {file.file_metadata, file.object_size, file.validation_etag, file.local_version});
+        {file.file_metadata,
+         file.footer_summary,
+         file.object_size,
+         file.validation_etag,
+         file.local_version});
     }
   } else {
     if (resolved_file_paths.empty()) {
