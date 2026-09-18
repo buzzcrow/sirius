@@ -48,14 +48,26 @@ struct local_file_version {
 
 /// Extract the size and nanosecond mtime from an already-open local file.
 /// The descriptor anchors the evidence to the exact inode that will be read.
-inline local_file_version local_file_version_from_fd(int fd) noexcept
+inline local_file_version local_file_version_from_stat(struct stat const& st) noexcept
 {
-  struct stat st {};
-  if (::fstat(fd, &st) != 0 || st.st_size < 0) { return {}; }
+  if (st.st_size < 0) { return {}; }
   return {true,
           static_cast<std::size_t>(st.st_size),
           static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1000000000LL +
             static_cast<std::int64_t>(st.st_mtim.tv_nsec)};
+}
+
+inline local_file_version local_file_version_from_fd(int fd) noexcept
+{
+  struct stat st {};
+  return ::fstat(fd, &st) == 0 ? local_file_version_from_stat(st) : local_file_version{};
+}
+
+/// Two separately opened descriptors may use different flags, but must still
+/// refer to the same inode before their reads share one footer/version record.
+inline bool same_local_file_identity(struct stat const& lhs, struct stat const& rhs) noexcept
+{
+  return lhs.st_dev == rhs.st_dev && lhs.st_ino == rhs.st_ino;
 }
 
 /// Cache identity for a local file. Versioned files can share an entry; an

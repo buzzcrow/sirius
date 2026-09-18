@@ -532,10 +532,23 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     throw std::runtime_error("uring_reactor::create_io_object: O_DIRECT open failed: " + path +
                              ": " + strerror(errno));
 
-  auto const local_version = local_file_version_from_fd(fd.native_handle());
-  if (!local_version.available) {
+  struct stat buffered_stat {};
+  struct stat direct_stat {};
+  if (::fstat(fd.native_handle(), &buffered_stat) != 0 ||
+      ::fstat(fd_direct.native_handle(), &direct_stat) != 0) {
     throw std::runtime_error("uring_reactor::create_io_object: fstat failed: " + path + ": " +
                              strerror(errno));
+  }
+  // The two path opens need different flags, but an atomic replacement between
+  // them can otherwise pair the buffered footer fd with a different O_DIRECT
+  // data fd. Check inode identity on the descriptors actually used for reads.
+  if (!same_local_file_identity(buffered_stat, direct_stat)) {
+    throw std::runtime_error("uring_reactor::create_io_object: file changed between buffered "
+                             "and O_DIRECT opens: " + path);
+  }
+  auto const local_version = local_file_version_from_stat(buffered_stat);
+  if (!local_version.available) {
+    throw std::runtime_error("uring_reactor::create_io_object: invalid file size: " + path);
   }
   return std::make_unique<local_io_object>(
     std::move(path), std::move(fd), std::move(fd_direct), local_version.size, "", local_version);
