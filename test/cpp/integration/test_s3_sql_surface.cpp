@@ -1941,11 +1941,25 @@ TEST_CASE("Sirius Parquet table functions are registered as one-argument table f
     "FROM duckdb_functions() "
     "WHERE function_name IN ('sirius_read_parquet', 'sirius_parquet_scan') "
     "ORDER BY function_name");
-  REQUIRE(result->RowCount() == 2);
-  CHECK(result->GetValue(0, 0).ToString() == "sirius_parquet_scan");
-  CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
-  CHECK(result->GetValue(0, 1).ToString() == "sirius_read_parquet");
-  CHECK(result->GetValue(1, 1).ToString().find("VARCHAR") != std::string::npos);
+  REQUIRE(result->RowCount() == 3);
+
+  duckdb::idx_t sirius_parquet_scan_count = 0;
+  bool saw_sirius_read_parquet            = false;
+  for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+    auto const function_name = result->GetValue(0, row).ToString();
+    auto const parameter_types = result->GetValue(1, row).ToString();
+    CHECK(parameter_types.find("VARCHAR") != std::string::npos);
+
+    if (function_name == "sirius_parquet_scan") {
+      ++sirius_parquet_scan_count;
+    } else {
+      CHECK(function_name == "sirius_read_parquet");
+      saw_sirius_read_parquet = true;
+    }
+  }
+
+  CHECK(sirius_parquet_scan_count == 2);
+  CHECK(saw_sirius_read_parquet);
 }
 
 TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
