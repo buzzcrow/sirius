@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/file_version.hpp"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -100,6 +102,11 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
   /// earlier; an empty tag disables validation-based caching above —
   /// degraded performance, never wrong bytes.
   [[nodiscard]] virtual std::string_view validation_etag() const noexcept { return {}; }
+
+  /// Version evidence for a local file, obtained from the opened descriptor.
+  /// Remote objects return an unavailable value because their validation comes
+  /// from ETags.
+  [[nodiscard]] virtual local_file_version local_version() const noexcept { return {}; }
 };
 
 class sirius_io_object_metadata {

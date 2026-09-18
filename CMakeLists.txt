@@ -350,6 +350,7 @@ set(EXTENSION_SOURCES
     # Query lifecycle event bus (publisher + subscriber)
     src/event/query_event_publisher.cpp
     src/event/query_event_subscriber.cpp
+    src/scan/file_scan_bind_catalog.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp

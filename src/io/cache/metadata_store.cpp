@@ -26,7 +26,14 @@ void metadata_store::register_metadata(sirius_io_object const& obj,
   if (!metadata) return;
   auto const& key = obj.raw_file_cache_id();
   std::unique_lock lk(_mtx);
-  _by_key[key] = std::move(metadata);
+  for (auto it = _by_key.begin(); it != _by_key.end();) {
+    if (it->first != key && it->second.object_path == obj.object_path()) {
+      it = _by_key.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  _by_key[key] = entry{obj.object_path(), std::move(metadata)};
 }
 
 std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
@@ -41,7 +48,13 @@ std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
   std::shared_lock lk(_mtx);
   auto it = _by_key.find(cache_key);
   if (it == _by_key.end()) return nullptr;
-  return it->second;
+  return it->second.metadata;
+}
+
+std::size_t metadata_store::size() const
+{
+  std::shared_lock lk(_mtx);
+  return _by_key.size();
 }
 
 }  // namespace sirius::io::cache

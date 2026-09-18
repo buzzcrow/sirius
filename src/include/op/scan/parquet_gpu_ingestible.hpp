@@ -18,9 +18,11 @@
 
 // sirius
 #include <helper/logical_type.hpp>
+#include <io/file_version.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <scan/parquet_footer_summary.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -52,6 +54,10 @@ namespace sirius::op {
 class sirius_dynamic_filter_set;
 }  // namespace sirius::op
 
+namespace duckdb {
+struct SiriusParquetBoundScan;
+}
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -65,8 +71,25 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  /// One bound footer/version record per resolved Sirius-owned input. Empty
+  /// for the independent DuckDB-bound compatibility path.
+  struct bound_file {
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> metadata;
+    std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary;
+    std::size_t object_size{0};
+    std::string validation_etag;
+    sirius::io::local_file_version local_version;
+  };
+
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
+  /// Retains the exact immutable Sirius-owned bind through physical planning
+  /// and scan construction. Null for the independent DuckDB-bound path.
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan;
+  /// Kept alongside the pointer so downstream ownership checks need not derive
+  /// identity from a path or an unstable traversal order.
+  uint64_t scan_instance_id{0};
+  std::vector<bound_file> bound_files;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
@@ -126,6 +149,11 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths);
  */
 class parquet_split_info : public scan_info {
  public:
+  /// The immutable Sirius-owned bind that produced this split. Null for the
+  /// independent DuckDB-bound path.
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan;
+  uint64_t generation{0};
+  uint64_t scan_instance_id{0};
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
@@ -343,7 +371,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+  std::unique_ptr<scan_info> build_file_scan_info(std::size_t file_index,
+                                                  std::string const& file_path,
                                                   std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;

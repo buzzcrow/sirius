@@ -21,12 +21,14 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <exec/semi_future.hpp>
+#include <io/file_version.hpp>
 #include <io/types.hpp>
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstddef>
@@ -95,6 +97,20 @@ void complete(std::vector<std::unique_ptr<chunked_rx_request>>& chunks)
 }
 
 }  // namespace
+
+TEST_CASE("separately opened local descriptors must identify one file", "[uring_readv]")
+{
+  temp_file first{4096};
+  temp_file second{4096};
+  struct stat buffered_stat {};
+  struct stat direct_stat {};
+  struct stat other_stat {};
+  REQUIRE(::fstat(first.obj->buffered_handle(), &buffered_stat) == 0);
+  REQUIRE(::fstat(first.obj->odirect_handle(), &direct_stat) == 0);
+  REQUIRE(::fstat(second.obj->buffered_handle(), &other_stat) == 0);
+  CHECK(sirius::io::same_local_file_identity(buffered_stat, direct_stat));
+  CHECK_FALSE(sirius::io::same_local_file_identity(buffered_stat, other_stat));
+}
 
 TEST_CASE("io_object_segment single-buffer ctor seeds one buffer", "[uring_readv]")
 {

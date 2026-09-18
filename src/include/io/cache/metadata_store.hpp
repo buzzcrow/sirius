@@ -35,8 +35,9 @@ namespace sirius::io::cache {
  * skip the parse — without depending on whether the prefetching cache
  * has been initialised.
  *
- * The store is intentionally minimal: register / lookup, no eviction.
- * Entries live for the ioctx's lifetime.
+ * Registering a new version evicts this store's reference to older versions
+ * of the same path.  Readers already holding a returned shared_ptr retain it,
+ * so an old query never observes a replacement mid-flight.
  */
 class metadata_store {
  public:
@@ -60,12 +61,19 @@ class metadata_store {
 
   /// As above but keyed directly by @c raw_file_cache_id() — for callers that
   /// know the path but have not built an io_object yet.  Returns nullptr on miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
+ [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
     std::string const& cache_key) const;
 
+  [[nodiscard]] std::size_t size() const;
+
  private:
+  struct entry {
+    std::string object_path;
+    std::shared_ptr<sirius_io_object_metadata> metadata;
+  };
+
   mutable std::shared_mutex _mtx;
-  std::unordered_map<std::string, std::shared_ptr<sirius_io_object_metadata>> _by_key;
+  std::unordered_map<std::string, entry> _by_key;
 };
 
 }  // namespace sirius::io::cache

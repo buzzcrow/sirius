@@ -41,15 +41,39 @@ constexpr std::int64_t kRows = 100'000;
 
 // Throwaway, Sirius-disabled DuckDB writes the parquet so the extension callback does
 // not build a SiriusContext on it.
-void generate_parquet(fs::path const& path)
+void generate_parquet(fs::path const& path, std::int64_t rows = kRows)
 {
   sirius::test::scoped_sirius_disable disable_sirius;
   duckdb::DuckDB gen_db(nullptr);
   duckdb::Connection gen(gen_db);
-  auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
+  auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(rows) +
                      ")) TO " + sirius::test::sql_literal(path.string()) + " (FORMAT PARQUET);");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
+}
+
+bool plan_mentions_cardinality(std::string plan_text, duckdb::idx_t row_count)
+{
+  plan_text.erase(std::remove(plan_text.begin(), plan_text.end(), ','), plan_text.end());
+  auto const rows = std::to_string(row_count);
+  return plan_text.find("~" + rows + " rows") != std::string::npos ||
+         plan_text.find("EC: " + rows) != std::string::npos ||
+         plan_text.find("Estimated Cardinality: " + rows) != std::string::npos;
+}
+
+std::string explain_text(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query("EXPLAIN " + sql);
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  std::string out;
+  for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+    for (duckdb::idx_t column = 0; column < result->ColumnCount(); ++column) {
+      out += result->GetValue(column, row).ToString();
+      out.push_back('\n');
+    }
+  }
+  return out;
 }
 
 void write_config(fs::path const& yaml_path)
@@ -127,5 +151,63 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     REQUIRE_FALSE(res->HasError());  // pre-fix: "Unsupported scan function: sirius_read_parquet"
     REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
     REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == kRows);
+
+    // The bind-time footer's exact maximum lets DuckDB remove a predicate
+    // that cannot match before Sirius constructs any scan split. This covers
+    // the real SQL optimizer path in addition to the statistics callback's
+    // unit-level zonemap checks.
+    auto impossible = con.Query("SELECT count(*) FROM sirius_read_parquet(" +
+                                sirius::test::sql_literal(parquet_path.string()) +
+                                ") WHERE k >= " + std::to_string(kRows) + ";");
+    REQUIRE(impossible);
+    if (impossible->HasError()) {
+      UNSCOPED_INFO("sirius_read_parquet impossible-predicate query error: " << impossible->GetError());
+    }
+    REQUIRE_FALSE(impossible->HasError());
+    REQUIRE(impossible->GetValue(0, 0).GetValue<int64_t>() == 0);
+
+    // The explicit entry binds every listed file before planning. A direct
+    // CPU execution would throw from SiriusParquetScanFunction, so this also
+    // proves the multi-file table scan reached the GPU path.
+    auto second_path = tmp / "kv_second.parquet";
+    generate_parquet(second_path);
+    auto multi = con.Query("SELECT max(k), count(*) FROM sirius_parquet_scan([" +
+                           sirius::test::sql_literal(parquet_path.string()) + ", " +
+                           sirius::test::sql_literal(second_path.string()) + "]); ");
+    REQUIRE(multi);
+    if (multi->HasError()) {
+      UNSCOPED_INFO("sirius_parquet_scan list query error: " << multi->GetError());
+    }
+    REQUIRE_FALSE(multi->HasError());
+    REQUIRE(multi->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
+    REQUIRE(multi->GetValue(1, 0).GetValue<int64_t>() == 2 * kRows);
+
+    auto const glob = (tmp / "kv*.parquet").string();
+    auto expanded   = con.Query("SELECT max(k), count(*) FROM sirius_parquet_scan(" +
+                              sirius::test::sql_literal(glob) + ");");
+    REQUIRE(expanded);
+    if (expanded->HasError()) {
+      UNSCOPED_INFO("sirius_parquet_scan glob query error: " << expanded->GetError());
+    }
+    REQUIRE_FALSE(expanded->HasError());
+    REQUIRE(expanded->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
+    REQUIRE(expanded->GetValue(1, 0).GetValue<int64_t>() == 2 * kRows);
+
+    // This is planner-only: it exercises two independent Sirius binds and
+    // DuckDB's join optimizer, but does not execute a multi-scan GPU query.
+    // Join order is deliberately not asserted because it is a DuckDB version
+    // detail; the stable contract is that each exact footer cardinality reaches
+    // the optimizer as a separate scan estimate.
+    constexpr std::int64_t kSmallRows = 17;
+    auto small_path = tmp / "kv_small.parquet";
+    generate_parquet(small_path, kSmallRows);
+    auto const join_plan = explain_text(
+      con,
+      "SELECT count(*) FROM sirius_read_parquet(" + sirius::test::sql_literal(parquet_path.string()) +
+        ") AS large_input JOIN sirius_read_parquet(" + sirius::test::sql_literal(small_path.string()) +
+        ") AS small_input ON large_input.k = small_input.k");
+    INFO(join_plan);
+    CHECK(plan_mentions_cardinality(join_plan, kRows));
+    CHECK(plan_mentions_cardinality(join_plan, kSmallRows));
   }
 }

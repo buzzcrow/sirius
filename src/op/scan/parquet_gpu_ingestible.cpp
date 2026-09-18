@@ -32,6 +32,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <sirius_extension.hpp>
 
 // cudf
 #include <cudf/io/datasource.hpp>
@@ -241,10 +242,12 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          std::shared_ptr<duckdb::SiriusParquetBoundScan const> bound_scan)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
+      _bound_scan(std::move(bound_scan)),
       _needs_assembly(needs_output_assembly(*_plan))
   {
   }
@@ -299,7 +302,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_output,
                            cur_working,
                            cur_comp,
-                           std::move(slice_ds));
+                           std::move(slice_ds),
+                           _bound_scan ? _bound_scan->generation : 0,
+                           _bound_scan ? _bound_scan->scan_instance_id : 0);
       _produced_any = true;
       _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
@@ -349,7 +354,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_output_bytes=*/0,
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
-                           _empty_split_fallback->datasource);
+                           _empty_split_fallback->datasource,
+                           _bound_scan ? _bound_scan->generation : 0,
+                           _bound_scan ? _bound_scan->scan_instance_id : 0);
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
@@ -363,6 +370,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::unique_ptr<scan_info> emit_current()
   {
     auto split                     = std::make_unique<parquet_split_info>();
+    split->bound_scan              = _bound_scan;
+    split->generation              = _bound_scan ? _bound_scan->generation : 0;
+    split->scan_instance_id        = _bound_scan ? _bound_scan->scan_instance_id : 0;
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
@@ -378,6 +388,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   const std::size_t _cap;
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
+  std::shared_ptr<duckdb::SiriusParquetBoundScan const> _bound_scan;
   const bool _needs_assembly;
 
   std::vector<row_group_slice> _slices;
@@ -485,6 +496,10 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   : _info(std::move(info))
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
+  if (!bind.bound_files.empty() && bind.bound_files.size() != bind.resolved_file_paths.size()) {
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] bound footer metadata must align with every input file");
+  }
 
   // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
@@ -629,7 +644,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->bound_scan);
 }
 
 //===----------------------------------------------------------------------===//
@@ -654,8 +669,8 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, io_ctx);
+  return [this, idx, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(idx, file_path, io_ctx);
   };
 }
 
@@ -663,20 +678,42 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::size_t file_index,
+  std::string const& file_path,
+  std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
-  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
-  // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
-  // to one suffix-range GET that resolves the size and stashes the footer, so
-  // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
-  // GETs). Fall back to a plain cudf datasource only for local paths no sirius
-  // backend claims.
+  // Resolve the file to a sirius_datasource. A Sirius-bound footer and size
+  // are already fixed for this scan, so reuse the size and skip both the S3
+  // footer probe and a second size-discovery HEAD. DuckDB-bound scans still
+  // use the footer-probe hint.
+  auto const* bound_file =
+    _info->bound_files.empty() ? nullptr : &_info->bound_files.at(file_index);
+  if (_info->bound_scan && bound_file == nullptr) {
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] Sirius-owned scan lost its per-file bound footer record");
+  }
+  auto const& bound_file_metadata = bound_file ? bound_file->metadata : nullptr;
+  auto const& bound_footer_summary = bound_file ? bound_file->footer_summary : nullptr;
   std::shared_ptr<io::sirius_datasource> sirius_ds =
-    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+    bound_file
+      ? io_ctx->open_datasource(file_path, bound_file->object_size, bound_file->validation_etag)
+      : io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
+  }
+  if (bound_file && bound_file->local_version.available) {
+    auto const opened_version = sirius_ds->io_object().local_version();
+    if (!opened_version.available) {
+      SIRIUS_LOG_WARN(
+        "[parquet_gpu_ingestible] local file '{}' has no version evidence at scan; "
+        "falling back to the immutable-file convention",
+        file_path);
+    } else if (opened_version != bound_file->local_version) {
+      throw std::runtime_error("[parquet_gpu_ingestible] local file version conflict for '" +
+                               file_path + "'");
+    }
   }
 
   // Local copy of the shared options; the per-file filter pushdown decision is
@@ -685,8 +722,15 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  if (sirius_ds) {
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata = bound_file_metadata;
+  if (_info->bound_scan && !file_metadata) {
+    // A Sirius-owned bind has already completed every footer probe. Re-fetching
+    // here would silently mix this generation's fixed read view with a newer
+    // object, so this is an invariant violation rather than a cache miss.
+    throw sirius::internal_exception(
+      "[parquet_gpu_ingestible] Sirius-owned scan lost its bound parquet footer");
+  }
+  if (!file_metadata && sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();
@@ -830,6 +874,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
     }
   }
+
+  // A column can appear both in a carrier and in a predicate. Count it once
+  // when scaling the bind-time row-group totals for a projection.
+  std::unordered_set<std::size_t> selected_leaf_indices(selected_chunk_indices.begin(),
+                                                         selected_chunk_indices.end());
 
   auto row_group_indices = reader.all_row_groups(opts);
   if (ast_expression && !disable_filter_pushdown) {
@@ -1041,10 +1090,36 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
     auto const estimate = rg_contribution(metadata.row_groups[rg_idx]);
+    auto guarded_estimate = estimate;
+    if (bound_footer_summary) {
+      auto const summary_index = static_cast<std::size_t>(rg_idx);
+      if (summary_index >= bound_footer_summary->row_groups.size() ||
+          bound_footer_summary->row_groups[summary_index].num_rows !=
+            static_cast<std::uint64_t>(metadata.row_groups[rg_idx].num_rows)) {
+        throw sirius::internal_exception(
+          "[parquet_gpu_ingestible] bound footer summary does not match its parsed footer");
+      }
+      auto const leaf_count = metadata.row_groups[rg_idx].columns.size();
+      auto const projected_leaf_count = file_projected ? selected_leaf_indices.size() : leaf_count;
+      auto const bound_estimate = sirius::scan::estimate_projected_row_group(
+        *bound_footer_summary, summary_index, projected_leaf_count, leaf_count);
+      guarded_estimate.compressed_bytes = std::max(
+        guarded_estimate.compressed_bytes, static_cast<std::size_t>(bound_estimate.compressed_read_bytes));
+      guarded_estimate.decode_working_bytes = std::max(
+        guarded_estimate.decode_working_bytes, static_cast<std::size_t>(bound_estimate.decoded_working_bytes));
+    }
+    if (_info->bound_scan) {
+      auto& metering = _info->bound_scan->metering;
+      metering.planned_row_groups.fetch_add(1, std::memory_order_relaxed);
+      metering.planned_compressed_read_bytes.fetch_add(
+        guarded_estimate.compressed_bytes, std::memory_order_relaxed);
+      metering.planned_decode_working_bytes.fetch_add(
+        guarded_estimate.decode_working_bytes, std::memory_order_relaxed);
+    }
     out->row_groups.push_back({rg_idx,
-                               estimate.output_bytes,
-                               estimate.decode_working_bytes,
-                               estimate.compressed_bytes,
+                               guarded_estimate.output_bytes,
+                               guarded_estimate.decode_working_bytes,
+                               guarded_estimate.compressed_bytes,
                                metadata.row_groups[rg_idx].num_rows});
   }
 
@@ -1064,6 +1139,20 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
+  if (_info->bound_scan) {
+    if (split.bound_scan != _info->bound_scan || split.generation != _info->bound_scan->generation ||
+        split.scan_instance_id != _info->bound_scan->scan_instance_id) {
+      throw sirius::internal_exception(
+        "[parquet_gpu_ingestible] refusing a split owned by a different Sirius file scan");
+    }
+    for (auto const& slice : split.rg_slices) {
+      if (slice.generation != split.generation ||
+          slice.scan_instance_id != split.scan_instance_id) {
+        throw sirius::internal_exception(
+          "[parquet_gpu_ingestible] refusing a row-group slice owned by a different Sirius file scan");
+      }
+    }
+  }
 
   std::vector<std::unique_ptr<cudf::io::datasource>> sources;
   std::vector<cudf::io::parquet::FileMetaData> metadatas;
@@ -1148,9 +1237,41 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
+  // This is deliberately placed immediately around the cuDF reader rather
+  // than the asynchronous datasource/reactor layer. It reports each scan
+  // attempt and the exact split budgets consumed by that attempt, but makes no
+  // claim about physical backend bytes (which can include cache hits and
+  // alignment over-reads). The scope guard keeps failed reads visible without
+  // changing their exception behavior.
+  auto const* metering = split.bound_scan ? &split.bound_scan->metering : nullptr;
+  uint64_t materialized_row_groups = 0;
+  uint64_t compressed_read_budget  = 0;
+  uint64_t decode_working_budget   = 0;
+  for (auto const& slice : split.rg_slices) {
+    materialized_row_groups += slice.row_group_indices.size();
+    compressed_read_budget += slice.reserved_compressed_bytes;
+    decode_working_budget += slice.estimated_decode_working_bytes;
+  }
+  if (metering) {
+    metering->record_materialization_attempt(
+      materialized_row_groups, compressed_read_budget, decode_working_budget);
+  }
+  struct materialization_outcome {
+    duckdb::SiriusParquetMetering const* metering;
+    bool succeeded{false};
+    ~materialization_outcome()
+    {
+      if (metering && !succeeded) { metering->record_materialization_failure(); }
+    }
+  } outcome{metering};
+
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto [table, _] =
     cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+  if (metering) {
+    metering->record_materialization_success(static_cast<uint64_t>(table->num_rows()));
+  }
+  outcome.succeeded = true;
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared

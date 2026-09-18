@@ -24,10 +24,12 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "sirius_extension.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -50,6 +52,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -58,6 +61,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -265,10 +269,41 @@ sirius::planner::query make_empty_query()
                                 tinfo);
 }
 
+struct range_get_barrier {
+  void arrive_and_wait()
+  {
+    std::unique_lock lock(mutex);
+    arrived = true;
+    arrived_cv.notify_all();
+    release_cv.wait(lock, [this] { return released; });
+  }
+
+  [[nodiscard]] bool wait_until_arrived()
+  {
+    std::unique_lock lock(mutex);
+    return arrived_cv.wait_for(lock, std::chrono::seconds{5}, [this] { return arrived; });
+  }
+
+  void release()
+  {
+    std::lock_guard lock(mutex);
+    released = true;
+    release_cv.notify_all();
+  }
+
+  std::mutex mutex;
+  std::condition_variable arrived_cv;
+  std::condition_variable release_cv;
+  bool arrived{false};
+  bool released{false};
+};
+
 struct range_fault_policy {
   std::size_t fail_first_gets{0};
   bool fail_all_gets{false};
   int fail_status{503};
+  std::string successful_get_etag;
+  std::shared_ptr<range_get_barrier> first_get_barrier;
 };
 
 class range_s3_server {
@@ -319,6 +354,12 @@ class range_s3_server {
 
   [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
 
+  void set_successful_get_etag(std::string etag)
+  {
+    std::lock_guard lock(_etag_mutex);
+    _successful_get_etag = std::move(etag);
+  }
+
  private:
   static std::string errno_message() { return std::strerror(errno); }
 
@@ -365,16 +406,28 @@ class range_s3_server {
         send_all(fd, response);
         return;
       }
+      if (get_idx == 0 && _fault.first_get_barrier) { _fault.first_get_barrier->arrive_and_wait(); }
+      auto const response_etag = [&] {
+        std::lock_guard lock(_etag_mutex);
+        return _successful_get_etag;
+      }();
       if (auto range = parse_range(request)) {
         auto const [start, end] = *range;
         auto const len          = end - start + 1;
         response = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
                    "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) +
-                   "/" + std::to_string(_object.size()) + "\r\nConnection: close\r\n\r\n";
+                   "/" + std::to_string(_object.size());
+        if (!response_etag.empty()) {
+          response += "\r\nETag: " + response_etag;
+        }
+        response += "\r\nConnection: close\r\n\r\n";
         send_all(fd, response);
         send_all(fd, _object.data() + start, len);
       } else {
         response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
+                   (response_etag.empty()
+                      ? ""
+                      : "\r\nETag: " + response_etag) +
                    "\r\nConnection: close\r\n\r\n";
         send_all(fd, response);
         send_all(fd, _object.data(), _object.size());
@@ -444,6 +497,8 @@ class range_s3_server {
   std::uint16_t _port{0};
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
+  std::mutex _etag_mutex;
+  std::string _successful_get_etag{_fault.successful_get_etag};
   std::atomic<bool> _stop{false};
   std::atomic<int> _request_count{0};
   std::atomic<std::size_t> _get_count{0};
@@ -700,6 +755,10 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
     CHECK(snapshot.h2d_observed_ns_total == 0);
     CHECK(snapshot.h2d_observed_ns_max == 0);
     CHECK(snapshot.ttfb_ns == 0);
+    CHECK(snapshot.chunk_get_p50_ns == 0);
+    CHECK(snapshot.chunk_get_p95_ns == 0);
+    CHECK(snapshot.active_get_requests == 0);
+    CHECK(snapshot.peak_active_get_requests == 0);
     CHECK(snapshot.device_stream_sync_total == 0);
     CHECK(snapshot.retries_total == 0);
     CHECK(snapshot.terminal_failures_total == 0);
@@ -728,6 +787,10 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
     CHECK(snapshot.h2d_observed_ns_max > 0);
     CHECK(snapshot.h2d_observed_ns_max <= snapshot.h2d_observed_ns_total);
     CHECK(snapshot.ttfb_ns > 0);
+    CHECK(snapshot.chunk_get_p50_ns > 0);
+    CHECK(snapshot.chunk_get_p95_ns >= snapshot.chunk_get_p50_ns);
+    CHECK(snapshot.active_get_requests == 0);
+    CHECK(snapshot.peak_active_get_requests >= 1);
     CHECK(snapshot.device_stream_sync_total == 0);
     CHECK(snapshot.retries_total == 0);
     CHECK(snapshot.terminal_failures_total == 0);
@@ -837,6 +900,10 @@ TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3
   CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
   CHECK(snapshot.queue_wait_ns_total > 0);
   CHECK(snapshot.ttfb_ns > 0);
+  CHECK(snapshot.chunk_get_p50_ns > 0);
+  CHECK(snapshot.chunk_get_p95_ns >= snapshot.chunk_get_p50_ns);
+  CHECK(snapshot.active_get_requests == 0);
+  CHECK(snapshot.peak_active_get_requests >= 1);
   CHECK(snapshot.retries_total == 0);
   CHECK(snapshot.terminal_failures_total == 0);
   CHECK(snapshot.device_stream_sync_total == 0);
@@ -879,6 +946,165 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   REQUIRE(routed.contains(local_path));
   CHECK(routed.at(s3_uri) == io_context_type::restful);
   CHECK(is_local_backend(routed.at(local_path)));
+}
+
+TEST_CASE("bound parquet data-page refuses a replacement ETag",
+          "[s3][integration][routing][scan_manager][parquet_gpu_ingestible][version]")
+{
+  auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
+  auto const parquet_bytes = read_binary_file(fixture_path);
+  range_fault_policy fault{};
+  fault.successful_get_etag = "\"v2\"";
+  range_s3_server server(parquet_bytes, fault);
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+
+  std::string const uri = "s3://routing-bucket/bound-etag-nation.parquet";
+  auto const metadata   = read_local_parquet_metadata(fixture_path);
+  auto const object_size = parquet_bytes.size();
+
+  auto info = make_nation_table_info(uri);
+  auto bound = std::make_shared<duckdb::SiriusParquetBoundScan>(
+    std::vector<duckdb::SiriusParquetFileBindData>{{uri, metadata, object_size, "\"v1\"", {}, nullptr}},
+    static_cast<std::size_t>(metadata->num_rows));
+  bound->generation       = 1;
+  bound->scan_instance_id = 1;
+  info->bound_scan        = bound;
+  info->scan_instance_id  = bound->scan_instance_id;
+  info->bound_files.push_back({metadata, nullptr, object_size, "\"v1\"", {}});
+
+  auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  auto task = ingestible->next_split_provider(
+    [&manager](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+      auto ds = manager.create_datasource(std::string{path});
+      REQUIRE(ds != nullptr);
+      return ds->io_ctx();
+    });
+  REQUIRE(task);
+  auto file = task();
+  REQUIRE(file);
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto batches   = coalescer->push(std::move(file));
+  auto tail      = coalescer->flush();
+  for (auto& batch : tail) {
+    batches.push_back(std::move(batch));
+  }
+  REQUIRE(batches.size() == 1);
+  auto* gpu_space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+  sirius::op::scan::scan_operator_input input{std::move(batches.front())};
+  input.gpu_memory_space = gpu_space;
+  CHECK_THROWS_WITH(ingestible->materialize_table(input, stream.view()),
+                    Catch::Matchers::Contains("S3 version conflict"));
+  // Runtime D5 accounting is bind-local and remains observational even when
+  // the version guard rejects the data page; it must not feed a retry or a
+  // second footer/data read.
+  auto const metering = bound->metering.snapshot();
+  CHECK(metering.materialization_attempts == 1);
+  CHECK(metering.materialization_successes == 0);
+  CHECK(metering.materialization_failures == 1);
+  CHECK(metering.materialized_row_groups > 0);
+  CHECK(metering.materialized_compressed_read_budget_bytes > 0);
+  CHECK(metering.materialized_decode_working_budget_bytes > 0);
+}
+
+TEST_CASE("concurrent old and new S3 range generations stay isolated",
+          "[s3][integration][routing][scan_manager][version]")
+{
+  auto const payload = std::vector<std::uint8_t>(4096, std::uint8_t{7});
+  auto barrier       = std::make_shared<range_get_barrier>();
+  range_fault_policy fault{};
+  fault.successful_get_etag = "\"v1\"";
+  fault.first_get_barrier   = barrier;
+  range_s3_server server(payload, fault);
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+  std::string const uri = "s3://routing-bucket/generation-race.bin";
+
+  auto routed = manager.create_datasource(uri);
+  REQUIRE(routed != nullptr);
+  auto ioctx = routed->io_ctx();
+  REQUIRE(ioctx != nullptr);
+  auto old = ioctx->open_datasource(uri, payload.size(), "\"v1\"");
+  REQUIRE(old != nullptr);
+
+  std::exception_ptr old_error;
+  std::thread old_read([&] {
+    try {
+      std::vector<std::uint8_t> out(payload.size());
+      (void)old->host_read(0, out.size(), out.data());
+    } catch (...) {
+      old_error = std::current_exception();
+    }
+  });
+  REQUIRE(barrier->wait_until_arrived());
+
+  // The old range is now in flight. Advancing the server version and opening
+  // a new datasource must not let the old request consume the v2 bytes.
+  server.set_successful_get_etag("\"v2\"");
+  auto fresh = ioctx->open_datasource(uri, payload.size(), "\"v2\"");
+  REQUIRE(fresh != nullptr);
+  barrier->release();
+  old_read.join();
+
+  REQUIRE(old_error != nullptr);
+  try {
+    std::rethrow_exception(old_error);
+  } catch (std::runtime_error const& e) {
+    CHECK(std::string{e.what()}.find("S3 version conflict") != std::string::npos);
+  }
+
+  std::vector<std::uint8_t> fresh_out(payload.size());
+  CHECK(fresh->host_read(0, fresh_out.size(), fresh_out.data()) == fresh_out.size());
+  CHECK(fresh_out == payload);
+}
+
+TEST_CASE("prefetch cancellation cannot cross an S3 ETag generation",
+          "[s3][integration][routing][scan_manager][prefetch][version]")
+{
+  auto const payload = std::vector<std::uint8_t>(4096, std::uint8_t{13});
+  auto barrier       = std::make_shared<range_get_barrier>();
+  range_fault_policy fault{};
+  fault.successful_get_etag = "\"v1\"";
+  fault.first_get_barrier   = barrier;
+  range_s3_server server(payload, fault);
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), true);
+  cfg.enable_prefetch_cache = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  std::string const uri = "s3://routing-bucket/prefetch-generation-race.bin";
+
+  auto routed = manager.create_datasource(uri);
+  REQUIRE(routed != nullptr);
+  auto ioctx = routed->io_ctx();
+  REQUIRE(ioctx != nullptr);
+  REQUIRE(ioctx->cache() != nullptr);
+  REQUIRE(ioctx->cache()->is_armed());
+
+  std::vector<cudf::io::text::byte_range_info> ranges{{0, payload.size()}};
+  auto old = ioctx->open_datasource(uri, payload.size(), "\"v1\"");
+  REQUIRE(old != nullptr);
+  old->fadvise(ranges, std::nullopt);
+  old->prefetch(sirius::io::cache::prefetching_stage::just_in_time);
+  REQUIRE(barrier->wait_until_arrived());
+
+  // The v1 cache fill is now in flight.  A replacement bind gets a distinct
+  // cache identity; disposing the old handle must not cancel or poison it.
+  server.set_successful_get_etag("\"v2\"");
+  auto fresh = ioctx->open_datasource(uri, payload.size(), "\"v2\"");
+  REQUIRE(fresh != nullptr);
+  fresh->fadvise(ranges, std::nullopt);
+  fresh->prefetch(sirius::io::cache::prefetching_stage::just_in_time);
+  old->prefetch(sirius::io::cache::prefetching_stage::disposable);
+  old.reset();
+  barrier->release();
+
+  std::vector<std::uint8_t> fresh_out(payload.size());
+  CHECK(fresh->host_read(0, fresh_out.size(), fresh_out.data()) == fresh_out.size());
+  CHECK(fresh_out == payload);
 }
 
 TEST_CASE("split_provider resolver routes mixed parquet files independently",

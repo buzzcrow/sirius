@@ -117,6 +117,13 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
                                                                    std::uint64_t known_size);
 
+  /// As above, with the object's validation ETag captured by the bind-time
+  /// Range GET. Object-store backends attach it to each later range request;
+  /// local backends ignore it.
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
+                                                                   std::uint64_t known_size,
+                                                                   std::string validation_etag);
+
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).
@@ -262,7 +269,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// io_object without one.  Same distinct-virtual rationale as the hint
   /// variant above.
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
-                                                             std::uint64_t known_size);
+                                                              std::uint64_t known_size);
+
+  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+                                                              std::uint64_t known_size,
+                                                              std::string validation_etag);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,

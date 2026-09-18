@@ -38,6 +38,7 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/parquet_schema_mapping.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -1365,16 +1366,10 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will actually read + parse the footer.  On a warm
-  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
-  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
-  auto const cache_key     = normalize_path(uri);
-  auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-  auto const hint =
-    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
-
-  auto datasource = create_datasource(uri, hint);
+  // Every bind uses a footer Range GET. Its response supplies the versioned
+  // cache key, so an overwritten path cannot reuse a prior footer. A matching
+  // ETag still reuses the parsed metadata after this one validation request.
+  auto datasource = create_datasource(uri, sirius::io::open_hint::parquet_footer_probe);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
@@ -1404,14 +1399,288 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
       std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
   }
 
-  auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
+  auto schema               = sirius::io::parquet_helpers::extract_schema(*file_metadata);
+  auto const total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
+
+  // Keep the small, optimizer-safe facts separate from the parsed cuDF footer.
+  // The latter is execution evidence and stays attached to the bound scan; no
+  // optimizer callback may need to parse it (or, worse, issue another read).
+  auto footer_summary = std::make_shared<sirius::scan::parquet_footer_summary>();
+  footer_summary->names.assign(schema.names.begin(), schema.names.end());
+  footer_summary->types.assign(schema.types.begin(), schema.types.end());
+  footer_summary->total_num_rows = static_cast<std::uint64_t>(total_num_rows);
+  footer_summary->row_groups.reserve(file_metadata->row_groups.size());
+  std::uint64_t first_row = 0;
+  for (auto const& row_group : file_metadata->row_groups) {
+    auto const row_count = static_cast<std::uint64_t>(row_group.num_rows);
+    if (row_count > std::numeric_limits<std::uint64_t>::max() - first_row) {
+      throw std::runtime_error("[sirius_scan_manager::describe_parquet] row-group row count overflow");
+    }
+    std::uint64_t compressed_bytes   = 0;
+    std::uint64_t uncompressed_bytes = 0;
+    for (auto const& chunk : row_group.columns) {
+      auto const compressed = static_cast<std::uint64_t>(chunk.meta_data.total_compressed_size);
+      auto const uncompressed = static_cast<std::uint64_t>(chunk.meta_data.total_uncompressed_size);
+      if (compressed > std::numeric_limits<std::uint64_t>::max() - compressed_bytes ||
+          uncompressed > std::numeric_limits<std::uint64_t>::max() - uncompressed_bytes) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::describe_parquet] row-group byte count overflow");
+      }
+      compressed_bytes += compressed;
+      uncompressed_bytes += uncompressed;
+    }
+    footer_summary->row_groups.push_back(
+      {first_row, row_count, compressed_bytes, uncompressed_bytes});
+    first_row += row_count;
+  }
+
+  // A footer null count is usable as a top-level SQL null statistic only for
+  // one-leaf, non-nested columns. A nested leaf's count describes repetition
+  // or child validity, not the enclosing value's SQL nullness.
+  footer_summary->column_null_counts.resize(footer_summary->names.size());
+  footer_summary->column_minmax.resize(footer_summary->names.size());
+  for (std::size_t column_index = 0; column_index < footer_summary->names.size(); ++column_index) {
+    auto& null_summary = footer_summary->column_null_counts[column_index];
+    auto& minmax       = footer_summary->column_minmax[column_index];
+    auto const leaves = sirius::op::scan::detail::leaf_indices_for_column(
+      *file_metadata, footer_summary->names[column_index]);
+    if (footer_summary->types[column_index].IsNested() || leaves.size() != 1) { continue; }
+    auto const leaf_index = leaves.front();
+    bool null_complete    = true;
+    bool minmax_complete  = true;
+    std::uint64_t null_count = 0;
+    auto const type_id = footer_summary->types[column_index].id();
+    // Keep only physical encodings that the optimizer callback can decode without
+    // consulting the mutable cuDF footer.  In particular, do not mistake an
+    // arbitrary BYTE_ARRAY (or a decimal FLBA of the wrong width) for a scalar.
+    auto const minmax_supported = type_id == duckdb::LogicalTypeId::BOOLEAN ||
+                                  type_id == duckdb::LogicalTypeId::TINYINT ||
+                                  type_id == duckdb::LogicalTypeId::SMALLINT ||
+                                  type_id == duckdb::LogicalTypeId::INTEGER ||
+                                  type_id == duckdb::LogicalTypeId::BIGINT ||
+                                  type_id == duckdb::LogicalTypeId::UTINYINT ||
+                                  type_id == duckdb::LogicalTypeId::USMALLINT ||
+                                  type_id == duckdb::LogicalTypeId::UINTEGER ||
+                                  type_id == duckdb::LogicalTypeId::UBIGINT ||
+                                  type_id == duckdb::LogicalTypeId::FLOAT ||
+                                  type_id == duckdb::LogicalTypeId::DOUBLE ||
+                                  type_id == duckdb::LogicalTypeId::DATE ||
+                                  type_id == duckdb::LogicalTypeId::TIME ||
+                                  type_id == duckdb::LogicalTypeId::TIMESTAMP ||
+                                  type_id == duckdb::LogicalTypeId::DECIMAL ||
+                                  type_id == duckdb::LogicalTypeId::VARCHAR ||
+                                  type_id == duckdb::LogicalTypeId::BLOB ||
+                                  type_id == duckdb::LogicalTypeId::UUID;
+    auto const expected_size = type_id == duckdb::LogicalTypeId::BOOLEAN ? 1U :
+                               (type_id == duckdb::LogicalTypeId::BIGINT ||
+                                type_id == duckdb::LogicalTypeId::UBIGINT)
+                                 ? 8U
+                                 : 4U;
+    // A row-group chunk only names its schema path. Resolve this top-level,
+    // scalar leaf in the parsed footer before considering byte-array DECIMAL
+    // statistics.  A LogicalType::DECIMAL alone is not proof that arbitrary
+    // BYTE_ARRAY bytes use Parquet's signed big-endian decimal encoding.
+    auto const top_level_schema_leaf = [&]() -> cudf::io::parquet::SchemaElement const* {
+      if (file_metadata->schema.empty()) { return nullptr; }
+      auto const& root = file_metadata->schema.front();
+      std::size_t schema_index = 1;
+      for (int child = 0; child < root.num_children; ++child) {
+        if (schema_index >= file_metadata->schema.size()) { return nullptr; }
+        auto const& element = file_metadata->schema[schema_index];
+        if (element.name == footer_summary->names[column_index]) {
+          return element.num_children == 0 ? &element : nullptr;
+        }
+        // The footer schema is preorder-flattened. Skip exactly this child's
+        // subtree so repeated nested child names cannot be mistaken for a
+        // top-level leaf.
+        int pending = 1;
+        while (pending > 0) {
+          if (schema_index >= file_metadata->schema.size()) { return nullptr; }
+          pending += file_metadata->schema[schema_index].num_children - 1;
+          ++schema_index;
+        }
+      }
+      return nullptr;
+    }();
+    auto const schema_declares_decimal = [](cudf::io::parquet::SchemaElement const& element) {
+      return (element.logical_type.has_value() &&
+              element.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL) ||
+             (element.converted_type.has_value() &&
+              *element.converted_type == cudf::io::parquet::ConvertedType::DECIMAL);
+    };
+    auto const byte_decimal = type_id == duckdb::LogicalTypeId::DECIMAL &&
+                              top_level_schema_leaf != nullptr &&
+                              schema_declares_decimal(*top_level_schema_leaf) &&
+                              (top_level_schema_leaf->type == cudf::io::parquet::Type::BYTE_ARRAY ||
+                               top_level_schema_leaf->type ==
+                                 cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY);
+    auto const temporal_unit = [&]() -> std::optional<sirius::scan::parquet_stat_time_unit> {
+      if (top_level_schema_leaf == nullptr) { return std::nullopt; }
+      auto const modern_unit = [](cudf::io::parquet::TimeUnit::Type unit)
+        -> std::optional<sirius::scan::parquet_stat_time_unit> {
+        switch (unit) {
+          case cudf::io::parquet::TimeUnit::MILLIS: return sirius::scan::parquet_stat_time_unit::millis;
+          case cudf::io::parquet::TimeUnit::MICROS: return sirius::scan::parquet_stat_time_unit::micros;
+          case cudf::io::parquet::TimeUnit::NANOS: return sirius::scan::parquet_stat_time_unit::nanos;
+          default: return std::nullopt;
+        }
+      };
+      auto const& leaf = *top_level_schema_leaf;
+      if (type_id == duckdb::LogicalTypeId::TIME) {
+        if (leaf.logical_type.has_value() && leaf.logical_type->type == cudf::io::parquet::LogicalType::TIME &&
+            leaf.logical_type->time_type.has_value()) {
+          return modern_unit(leaf.logical_type->time_type->unit.type);
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIME_MILLIS) {
+          return sirius::scan::parquet_stat_time_unit::millis;
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIME_MICROS) {
+          return sirius::scan::parquet_stat_time_unit::micros;
+        }
+      }
+      if (type_id == duckdb::LogicalTypeId::TIMESTAMP) {
+        if (leaf.logical_type.has_value() &&
+            leaf.logical_type->type == cudf::io::parquet::LogicalType::TIMESTAMP &&
+            leaf.logical_type->timestamp_type.has_value()) {
+          return modern_unit(leaf.logical_type->timestamp_type->unit.type);
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIMESTAMP_MILLIS) {
+          return sirius::scan::parquet_stat_time_unit::millis;
+        }
+        if (leaf.converted_type.has_value() &&
+            *leaf.converted_type == cudf::io::parquet::ConvertedType::TIMESTAMP_MICROS) {
+          return sirius::scan::parquet_stat_time_unit::micros;
+        }
+      }
+      return std::nullopt;
+    }();
+    if (temporal_unit.has_value()) { minmax.time_unit = *temporal_unit; }
+    auto physical_and_size_match = [&](cudf::io::parquet::Type physical,
+                                       std::size_t size) {
+      if (type_id == duckdb::LogicalTypeId::FLOAT) {
+        return physical == cudf::io::parquet::Type::FLOAT && size == sizeof(float);
+      }
+      if (type_id == duckdb::LogicalTypeId::DOUBLE) {
+        return physical == cudf::io::parquet::Type::DOUBLE && size == sizeof(double);
+      }
+      if (type_id == duckdb::LogicalTypeId::VARCHAR || type_id == duckdb::LogicalTypeId::BLOB) {
+        return physical == cudf::io::parquet::Type::BYTE_ARRAY;
+      }
+      if (type_id == duckdb::LogicalTypeId::UUID) {
+        return physical == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY && size == 16;
+      }
+      if (type_id == duckdb::LogicalTypeId::DECIMAL) {
+        if ((physical == cudf::io::parquet::Type::INT32 && size == 4) ||
+            (physical == cudf::io::parquet::Type::INT64 && size == 8)) {
+          return true;
+        }
+        if (!byte_decimal || physical != top_level_schema_leaf->type || size == 0 ||
+            size > sizeof(duckdb::hugeint_t)) {
+          return false;
+        }
+        // BYTE_ARRAY carries its own length; FLBA must agree with the leaf
+        // declaration as well as staying inside DuckDB's decimal128 carrier.
+        return physical == cudf::io::parquet::Type::BYTE_ARRAY ||
+               (top_level_schema_leaf->type_length > 0 &&
+                size == static_cast<std::size_t>(top_level_schema_leaf->type_length));
+      }
+      if (type_id == duckdb::LogicalTypeId::TIME) {
+        return temporal_unit == sirius::scan::parquet_stat_time_unit::millis &&
+                 physical == cudf::io::parquet::Type::INT32 && size == sizeof(std::int32_t) ||
+               temporal_unit == sirius::scan::parquet_stat_time_unit::micros &&
+                 physical == cudf::io::parquet::Type::INT64 && size == sizeof(std::int64_t);
+      }
+      if (type_id == duckdb::LogicalTypeId::TIMESTAMP) {
+        return (temporal_unit == sirius::scan::parquet_stat_time_unit::millis ||
+                temporal_unit == sirius::scan::parquet_stat_time_unit::micros) &&
+               physical == cudf::io::parquet::Type::INT64 && size == sizeof(std::int64_t);
+      }
+      auto const expected = type_id == duckdb::LogicalTypeId::BOOLEAN
+                              ? cudf::io::parquet::Type::BOOLEAN
+                              : (expected_size == 8U ? cudf::io::parquet::Type::INT64
+                                                     : cudf::io::parquet::Type::INT32);
+      return physical == expected && size == expected_size;
+    };
+    for (auto const& row_group : file_metadata->row_groups) {
+      if (leaf_index >= row_group.columns.size()) {
+        null_complete = false;
+        minmax_complete = false;
+        break;
+      }
+      auto const& chunk = row_group.columns[leaf_index];
+      auto const& path  = chunk.meta_data.path_in_schema;
+      auto const& stats = chunk.meta_data.statistics;
+      if (path.size() != 1 || path.front() != footer_summary->names[column_index] ||
+          !stats.null_count.has_value()) {
+        null_complete = false;
+      } else {
+        auto const chunk_null_count = static_cast<std::uint64_t>(*stats.null_count);
+        if (chunk_null_count > std::numeric_limits<std::uint64_t>::max() - null_count) {
+          null_complete = false;
+        } else {
+          null_count += chunk_null_count;
+        }
+      }
+      if (!minmax_supported || !stats.min_value ||
+          !stats.max_value || !stats.is_min_value_exact || !*stats.is_min_value_exact ||
+          !stats.is_max_value_exact || !*stats.is_max_value_exact ||
+          !physical_and_size_match(chunk.meta_data.type, stats.min_value->size()) ||
+          !physical_and_size_match(chunk.meta_data.type, stats.max_value->size())) {
+        minmax_complete = false;
+      } else {
+        minmax.min_values.push_back(*stats.min_value);
+        minmax.max_values.push_back(*stats.max_value);
+      }
+    }
+    null_summary.complete   = null_complete;
+    null_summary.null_count = null_complete ? null_count : 0;
+    minmax.complete = minmax_complete && minmax.min_values.size() == file_metadata->row_groups.size() &&
+                      minmax.max_values.size() == file_metadata->row_groups.size();
+    if (!minmax.complete) {
+      minmax.min_values.clear();
+      minmax.max_values.clear();
+    } else if (byte_decimal) {
+      minmax.encoding = sirius::scan::parquet_minmax_encoding::big_endian_decimal;
+    }
+  }
 
   parquet_bind_result result;
-  result.return_types   = std::move(schema.types);
-  result.names          = std::move(schema.names);
-  result.object_size    = datasource->size();
-  result.total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
+  result.return_types    = std::move(schema.types);
+  result.names           = std::move(schema.names);
+  result.file_metadata   = std::move(file_metadata);
+  result.footer_summary  = std::move(footer_summary);
+  result.validation_etag = std::string(datasource->io_object().validation_etag());
+  result.local_version   = datasource->io_object().local_version();
+  result.object_size     = datasource->size();
+  result.total_num_rows  = total_num_rows;
   return result;
+}
+
+std::vector<parquet_bind_result> sirius_scan_manager::describe_parquet(
+  std::vector<std::string> const& uris)
+{
+  std::vector<parquet_bind_result> results(uris.size());
+  if (uris.empty()) { return results; }
+
+  exec::scoped_dispatcher dispatcher(_thread_pool, _thread_pool.num_threads());
+  std::mutex error_mutex;
+  std::exception_ptr first_error;
+  for (std::size_t i = 0; i < uris.size(); ++i) {
+    dispatcher.enqueue([this, &uris, &results, &error_mutex, &first_error, i] {
+      try {
+        results[i] = describe_parquet(uris[i]);
+      } catch (...) {
+        std::lock_guard lock(error_mutex);
+        if (!first_error) { first_error = std::current_exception(); }
+      }
+    });
+  }
+  dispatcher.wait_for_all();
+  if (first_error) { std::rethrow_exception(first_error); }
+  return results;
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,

@@ -18,6 +18,7 @@
 
 #include "io/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -27,6 +28,25 @@
 #include <utility>
 
 namespace sirius::io::rest {
+
+namespace {
+
+std::uint64_t histogram_percentile_upper_bound(
+  std::array<std::uint64_t, rest_latency_histogram_buckets> const& histogram,
+  std::uint64_t sample_count,
+  std::uint64_t percentile) noexcept
+{
+  if (sample_count == 0) { return 0; }
+  auto const target = (sample_count * percentile + 99) / 100;
+  std::uint64_t seen = 0;
+  for (std::size_t i = 0; i < histogram.size(); ++i) {
+    seen += histogram[i];
+    if (seen >= target) { return std::uint64_t{1} << i; }
+  }
+  return std::uint64_t{1} << (histogram.size() - 1);
+}
+
+}  // namespace
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
   : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
@@ -59,7 +79,17 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
     agg.blocking_host_get_wall_ns_max =
       std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
+    for (std::size_t i = 0; i < agg.chunk_get_latency_histogram.size(); ++i) {
+      agg.chunk_get_latency_histogram[i] += s.chunk_get_latency_histogram[i];
+    }
+    agg.active_get_requests += s.active_get_requests;
+    agg.peak_active_get_requests =
+      std::max(agg.peak_active_get_requests, s.peak_active_get_requests);
   }
+  agg.chunk_get_p50_ns =
+    histogram_percentile_upper_bound(agg.chunk_get_latency_histogram, agg.chunk_get_count, 50);
+  agg.chunk_get_p95_ns =
+    histogram_percentile_upper_bound(agg.chunk_get_latency_histogram, agg.chunk_get_count, 95);
   return agg;
 }
 
@@ -196,6 +226,22 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
                                           static_cast<size_t>(known_size));
 }
 
+std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
+                                                               std::uint64_t known_size,
+                                                               std::string validation_etag)
+{
+  auto parsed = sirius::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  return std::make_shared<rest_io_object>(std::move(path),
+                                          std::move(parsed.host),
+                                          std::move(parsed.path),
+                                          static_cast<size_t>(known_size),
+                                          std::move(validation_etag));
+}
+
 std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);
@@ -210,14 +256,30 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
   footer_probe probe = _reactors.front()->fetch_footer_suffix(
     parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
   if (!probe.bytes) {
-    // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
-    // fall back to a plain HEAD for the size, with no stash.
+    // A malformed suffix response gives neither a usable footer window nor a
+    // total object size. Preserve the established fallback: HEAD supplies the
+    // metadata needed to construct the datasource and its ETag is the best
+    // version evidence available for this read attempt.
     auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
+    if (head.etag.empty()) {
+      SIRIUS_LOG_WARN(
+        "rest_ioctx: footer Range GET could not establish size/ETag for s3://{}/{}; "
+        "HEAD fallback has no ETag, using the immutable-object assumption",
+        parsed.host,
+        parsed.path);
+    }
     return std::make_shared<rest_io_object>(std::move(path),
                                             std::move(parsed.host),
                                             std::move(parsed.path),
                                             head.object_size,
                                             std::move(head.etag));
+  }
+  if (probe.etag.empty()) {
+    SIRIUS_LOG_WARN(
+      "rest_ioctx: footer Range GET has no ETag for s3://{}/{}; "
+      "falling back to the immutable-object assumption",
+      parsed.host,
+      parsed.path);
   }
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),

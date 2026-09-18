@@ -34,6 +34,7 @@
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "scan/parquet_footer_summary.hpp"
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
@@ -51,6 +52,10 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
+
+namespace cudf::io::parquet {
+struct FileMetaData;
+}
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -419,6 +424,16 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
 struct parquet_bind_result {
   duckdb::vector<duckdb::LogicalType> return_types;
   duckdb::vector<std::string> names;
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  /// Scalar facts extracted from @c file_metadata while binding. Consumers
+  /// must use this rather than parsing or fetching a footer again.
+  std::shared_ptr<sirius::scan::parquet_footer_summary const> footer_summary;
+  /// ETag supplied by the footer probe response for object-store sources.
+  /// Empty when the backend has no ETag evidence.
+  std::string validation_etag;
+  /// Local file evidence captured from the bind-time fd. Unavailable for
+  /// remote objects and when a backend cannot expose local evidence.
+  sirius::io::local_file_version local_version;
   std::size_t object_size{0};
   std::size_t total_num_rows{0};
 };
@@ -696,6 +711,9 @@ class sirius_scan_manager {
     std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
+  /// Bind every supplied Parquet footer with bounded concurrency, preserving
+  /// input order in the returned vector. Any probe failure aborts the bind.
+  std::vector<parquet_bind_result> describe_parquet(std::vector<std::string> const& uris);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager

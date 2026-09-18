@@ -3,10 +3,10 @@ sirius:
     num_gpus: 1
   memory:
     gpu:
-      usage_limit_fraction: 0.5
+      usage_limit_fraction: 0.4
       reservation_limit_fraction: 1.0
     host:
-      capacity_bytes: 32000000000
+      capacity_bytes: 16000000000
       initial_number_pools: 10
       pool_size: 512
       block_size: 1048576

@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/metadata_store.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
@@ -1474,6 +1475,126 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   CHECK(server.get_count() == 1);
 }
 
+TEST_CASE("rest cache identity includes object version evidence", "[s3][rest][cache]")
+{
+  using sirius::io::rest::rest_io_object;
+  rest_io_object v1{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object same{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object v2{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v2\""};
+  rest_io_object no_tag_a{"s3://bucket/key.parquet", "bucket", "key.parquet", 100};
+  rest_io_object no_tag_b{"s3://bucket/key.parquet", "bucket", "key.parquet", 100};
+
+  CHECK(v1.raw_file_cache_id() == same.raw_file_cache_id());
+  CHECK(v1.raw_file_cache_id() != v2.raw_file_cache_id());
+  CHECK(no_tag_a.raw_file_cache_id() != no_tag_b.raw_file_cache_id());
+}
+
+TEST_CASE("metadata store retires an older version without invalidating its readers",
+          "[s3][rest][cache]")
+{
+  struct metadata final : sirius::io::sirius_io_object_metadata {};
+  using sirius::io::rest::rest_io_object;
+  sirius::io::cache::metadata_store store;
+  rest_io_object v1{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v1\""};
+  rest_io_object v2{"s3://bucket/key.parquet", "bucket", "key.parquet", 100, "\"v2\""};
+  auto old = std::make_shared<metadata>();
+  store.register_metadata(v1, old);
+  // This models an already-bound query. Its reader retains the metadata even
+  // after the store releases its reference while advancing to a new version.
+  auto reader = store.get_metadata(v1);
+  REQUIRE(reader == old);
+  store.register_metadata(v2, std::make_shared<metadata>());
+
+  CHECK(store.size() == 1);
+  CHECK(store.get_metadata(v1) == nullptr);
+  CHECK(store.get_metadata(v2) != nullptr);
+  CHECK(reader == old);
+  CHECK(old != nullptr);
+}
+
+TEST_CASE("rest range reads validate a bound ETag without HEAD", "[s3][integration][rest][etag]")
+{
+  auto payload = deterministic_payload(4096);
+
+  SECTION("matching response ETag succeeds")
+  {
+    range_fault_policy fault{};
+    fault.successful_get_etag = "\"v1\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK(datasource->host_read(0, out.size(), out.data()) == out.size());
+    CHECK(out == payload);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("changed response ETag fails as a version conflict")
+  {
+    range_fault_policy fault{};
+    fault.successful_get_etag = "\"v2\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+    std::vector<std::uint8_t> out(payload.size());
+    try {
+      (void)datasource->host_read(0, out.size(), out.data());
+      FAIL("range read should fail when its ETag differs from the bound ETag");
+    } catch (std::runtime_error const& e) {
+      CHECK(std::string{e.what()}.find("S3 version conflict") != std::string::npos);
+    }
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("rest retries a bound range read without losing its ETag generation",
+          "[s3][integration][rest][etag][retry]")
+{
+  auto const payload = deterministic_payload(4096);
+
+  SECTION("retry with the bound version succeeds")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets      = 1;
+    fault.fail_status          = 503;
+    fault.successful_get_etag  = "\"v1\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/retry-etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK(datasource->host_read(0, out.size(), out.data()) == out.size());
+    CHECK(out == payload);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("retry that observes a new version fails instead of mixing generations")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets      = 1;
+    fault.fail_status          = 503;
+    fault.successful_get_etag  = "\"v2\"";
+    range_http_server server(payload, fault);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ctx->open_datasource(
+      "s3://bucket/retry-etag.bin", static_cast<std::uint64_t>(payload.size()), "\"v1\"");
+
+    std::vector<std::uint8_t> out(payload.size());
+    CHECK_THROWS_WITH(datasource->host_read(0, out.size(), out.data()),
+                      Catch::Matchers::Contains("S3 version conflict"));
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
+  }
+}
+
 TEST_CASE("rest footer suffix parses Content-Range totals", "[s3][integration][rest][footerbind]")
 {
   using sirius::io::rest::content_range_total;
@@ -1676,11 +1797,14 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   CHECK(second.object_size == result.object_size);
   CHECK(second.total_num_rows == result.total_num_rows);
   CHECK(second.names == result.names);
-  CHECK(server.head_count() == 1);
-  CHECK(server.get_count() == 1);
+  // A rebind validates the object with a footer Range GET.  This catches a
+  // same-key overwrite without an extra HEAD. This fake range server provides
+  // no stable ETag, so it deliberately does not assert a versioned-cache hit.
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 2);
 }
 
-TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
+TEST_CASE("footer suffix probe falls back to HEAD size and ETag evidence",
           "[s3][integration][rest][footerbind]")
 {
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
@@ -1688,13 +1812,15 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
   SECTION("missing Content-Range")
   {
     range_fault_policy fault{};
-    fault.omit_content_range = true;
+    fault.omit_content_range   = true;
+    fault.successful_head_etag = "\"head-v1\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v1\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1703,14 +1829,36 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
   {
     range_fault_policy fault{};
     fault.unknown_content_range_total = true;
+    fault.successful_head_etag        = "\"head-v2\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v2\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
+  }
+
+  SECTION("fallback HEAD ETag validates later data ranges")
+  {
+    range_fault_policy fault{};
+    fault.ignore_range_with_200 = true;
+    fault.successful_get_etag   = "\"range-v2\"";
+    fault.successful_head_etag  = "\"head-v1\"";
+    range_http_server server(parquet, fault);
+    auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->io_object().validation_etag() == "\"head-v1\"");
+
+    std::array<std::uint8_t, 1> out{};
+    CHECK_THROWS_WITH(datasource->host_read(0, out.size(), out.data()),
+                      Catch::Matchers::Contains("S3 version conflict"));
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 2);
   }
 
   SECTION("server ignores Range with 200 full-body")
@@ -1718,13 +1866,14 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     range_fault_policy fault{};
     fault.ignore_range_with_200 = true;
     fault.successful_get_etag   = "\"discarded-200-tag\"";
+    fault.successful_head_etag  = "\"head-v3\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
-    CHECK(datasource->io_object().validation_etag().empty());
+    CHECK(datasource->io_object().validation_etag() == "\"head-v3\"");
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1742,6 +1891,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == payload.size());
+    CHECK(datasource->io_object().validation_etag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
     CHECK(server.body_bytes_sent() < payload.size());
@@ -1759,6 +1909,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }

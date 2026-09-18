@@ -66,6 +66,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "sirius_extension.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
@@ -77,13 +78,20 @@ namespace sirius::planner {
 std::vector<std::string> resolve_parquet_scan_file_paths(
   std::string_view function_name,
   duckdb::FunctionData const* bind_data,
-  duckdb::vector<duckdb::Value> const& parameters)
+  duckdb::vector<duckdb::Value> const& /*parameters*/)
 {
-  if (function_name == "sirius_read_parquet") {
-    // Internal S3 rewrite target: its bind_data is SiriusReadParquetBindData, not
-    // MultiFileBindData — the resolved URI travels in parameters[0].
-    if (parameters.empty() || parameters.front().IsNull()) { return {}; }
-    return {parameters.front().GetValue<std::string>()};
+  if (function_name == "sirius_read_parquet" || function_name == "sirius_parquet_scan") {
+    // The Sirius-owned single-file Parquet function carries its fixed URI in
+    // bind data rather than MultiFileBindData. Physical planning must consume
+    // that bind result, not re-derive the file identity from LogicalGet parameters.
+    auto const* bound = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(bind_data);
+    if (bound == nullptr || bound->files().empty()) { return {}; }
+    std::vector<std::string> file_paths;
+    file_paths.reserve(bound->files().size());
+    for (auto const& file : bound->files()) {
+      file_paths.push_back(file.uri);
+    }
+    return file_paths;
   }
   if (function_name == "parquet_scan" || function_name == "read_parquet" ||
       function_name == "iceberg_scan") {
@@ -155,13 +163,35 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   info->table_filters      = std::move(scan_op.table_filters);
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
-  if (scan_op.function.name == "sirius_read_parquet") {
+  if (scan_op.function.name == "sirius_read_parquet" ||
+      scan_op.function.name == "sirius_parquet_scan") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
-        "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
+        "[sirius_physical_plan_generator::build_parquet_table_info] Sirius-owned Parquet scan "
         "has no URI parameter");
     }
     info->resolved_file_paths = std::move(resolved_file_paths);
+    auto const* bind =
+      dynamic_cast<duckdb::SiriusReadParquetBindData const*>(scan_op.bind_data.get());
+    if (!bind || !bind->bound_scan || bind->files().size() != info->resolved_file_paths.size()) {
+      throw std::runtime_error(
+        "Sirius-owned Parquet scan has no bound footer metadata for every input file");
+    }
+    info->bound_scan       = bind->bound_scan;
+    info->scan_instance_id = bind->scan_instance_id();
+    info->bound_files.reserve(bind->files().size());
+    for (auto const& file : bind->files()) {
+      if (!file.file_metadata) {
+        throw std::runtime_error(
+          "Sirius-owned Parquet scan has an input without bound footer metadata");
+      }
+      info->bound_files.push_back(
+        {file.file_metadata,
+         file.footer_summary,
+         file.object_size,
+         file.validation_etag,
+         file.local_version});
+    }
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
@@ -415,7 +445,8 @@ void wrap_table_scan_source(
                               sirius_ctx.get());
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
+  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet" ||
+             fn == "sirius_parquet_scan") {
     // Parquet applies AST filters in the reader; post-decode uses membership only.
     leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
                               scan,

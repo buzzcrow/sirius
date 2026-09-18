@@ -1928,21 +1928,38 @@ std::uint64_t tpch_dataset_bytes(fs::path const& root)
 
 }  // namespace
 
-TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
+TEST_CASE("Sirius Parquet table functions are registered as one-argument table functions",
           "[sql][s3][registration]")
 {
   duckdb::DuckDB db(nullptr);
   load_sirius_extension(db);
   duckdb::Connection con(db);
 
-  auto result = require_query_ok(con,
-                                 "SELECT function_name, parameter_types "
-                                 "FROM duckdb_functions() "
-                                 "WHERE function_name = 'sirius_read_parquet' "
-                                 "ORDER BY function_name");
-  REQUIRE(result->RowCount() == 1);
-  CHECK(result->GetValue(0, 0).ToString() == "sirius_read_parquet");
-  CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
+  auto result = require_query_ok(
+    con,
+    "SELECT function_name, parameter_types "
+    "FROM duckdb_functions() "
+    "WHERE function_name IN ('sirius_read_parquet', 'sirius_parquet_scan') "
+    "ORDER BY function_name");
+  REQUIRE(result->RowCount() == 3);
+
+  duckdb::idx_t sirius_parquet_scan_count = 0;
+  bool saw_sirius_read_parquet            = false;
+  for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+    auto const function_name = result->GetValue(0, row).ToString();
+    auto const parameter_types = result->GetValue(1, row).ToString();
+    CHECK(parameter_types.find("VARCHAR") != std::string::npos);
+
+    if (function_name == "sirius_parquet_scan") {
+      ++sirius_parquet_scan_count;
+    } else {
+      CHECK(function_name == "sirius_read_parquet");
+      saw_sirius_read_parquet = true;
+    }
+  }
+
+  CHECK(sirius_parquet_scan_count == 2);
+  CHECK(saw_sirius_read_parquet);
 }
 
 TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
@@ -3900,8 +3917,16 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   REQUIRE(bind_data != nullptr);
   auto const* typed = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(bind_data.get());
   REQUIRE(typed != nullptr);
-  CHECK(typed->uri == uri);
-  CHECK(typed->total_num_rows == expected_orders_rows);
+  CHECK(typed->uri() == uri);
+  CHECK(typed->total_num_rows() == expected_orders_rows);
+  REQUIRE(typed->file_metadata() != nullptr);
+  CHECK(typed->object_size() > 0);
+  auto copied_bind_data = bind_data->Copy();
+  auto const* copied = dynamic_cast<duckdb::SiriusReadParquetBindData const*>(copied_bind_data.get());
+  REQUIRE(copied != nullptr);
+  CHECK(copied->bound_scan == typed->bound_scan);
+  CHECK(copied->file_metadata() == typed->file_metadata());
+  CHECK(copied->object_size() == typed->object_size());
   CHECK_FALSE(return_types.empty());
   CHECK_FALSE(names.empty());
   REQUIRE(table_function.cardinality != nullptr);

@@ -23,7 +23,9 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "sirius_extension.hpp"
 #include "telemetry/batch_telemetry.hpp"
 #include "telemetry/nvtx.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -610,6 +612,33 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
+  // Attribute task metrics only to the immutable Parquet bind carried by the
+  // input split. This avoids a process-wide memory-space sample, which could
+  // silently include unrelated concurrent queries. The scope guard observes
+  // failure only; it does not alter retry, reservation, or exception flow.
+  auto const* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(local_state._input_data.get());
+  auto const* parquet_split =
+    scan_input && scan_input->has_scan_metadata()
+      ? dynamic_cast<const op::scan::parquet_split_info*>(&scan_input->get_scan_info())
+      : nullptr;
+  // compute_task may consume the input split before this task records its
+  // completion metrics. Retain the owner locally; a raw pointer borrowed from
+  // parquet_split would otherwise dangle on the success path.
+  auto metered_bound_scan = parquet_split ? parquet_split->bound_scan : nullptr;
+  auto const* task_metering = metered_bound_scan ? &metered_bound_scan->metering : nullptr;
+  auto const task_input_basis = local_state.get_reservation_size_info()->input_basis;
+  if (task_metering) {
+    task_metering->record_pipeline_task_attempt(task_input_basis, reservation_bytes);
+  }
+  struct task_metering_outcome {
+    duckdb::SiriusParquetMetering const* metering;
+    bool succeeded{false};
+    ~task_metering_outcome()
+    {
+      if (metering && !succeeded) { metering->record_pipeline_task_failure(); }
+    }
+  } task_outcome{task_metering};
+
   auto executor_thread_resource_id = uuid::new_nil();
   if (telemetry::executor_thread_telemetry_handle.has_value()) {
     executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
@@ -779,6 +808,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     // An OOM before processing restarts at index 0 with the original input and remains eligible.
     bool const ratio_eligible = local_state._start_operator_index == 0;
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
+    if (task_metering) { task_metering->record_pipeline_task_success(peak_bytes, output_bytes); }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] Pipeline {}: memory history record - task={}, input_basis={}, output_bytes={}, "
       "reservation_bytes={}, peak_bytes={}, peak_bytes_to_materialize_input={}",
@@ -791,6 +821,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       peak_bytes,
       local_state.get_reservation_size_info()->bytes_to_materialize_input);
   }
+
+  // A task may legally finish without output data. Keep attempt/success
+  // accounting balanced while leaving its peak/output contribution at zero.
+  if (!output_data && task_metering) { task_metering->record_pipeline_task_success(0, 0); }
+  task_outcome.succeeded = true;
 
   // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
   // when compute_task replaced operator_input_output_data, releasing all shared locks.

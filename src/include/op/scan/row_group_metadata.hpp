@@ -25,6 +25,7 @@
 
 // standard library
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,14 +52,18 @@ struct row_group_slice {
                   std::size_t estimated_output_bytes,
                   std::size_t estimated_decode_working_bytes,
                   std::size_t reserved_compressed_bytes,
-                  std::shared_ptr<io::sirius_datasource> datasource)
+                  std::shared_ptr<io::sirius_datasource> datasource,
+                  uint64_t generation = 0,
+                  uint64_t scan_instance_id = 0)
     : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
       estimated_output_bytes(estimated_output_bytes),
       estimated_decode_working_bytes(estimated_decode_working_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes),
-      datasource(std::move(datasource))
+      datasource(std::move(datasource)),
+      generation(generation),
+      scan_instance_id(scan_instance_id)
   {
   }
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
@@ -71,6 +76,10 @@ struct row_group_slice {
   /// and reused by materialize_table. When null, materialize_table falls
   /// back to cudf::io::datasource::create(file_path).
   std::shared_ptr<io::sirius_datasource> datasource;
+  /// Zero means the independent DuckDB-bound compatibility path. Sirius-owned
+  /// scans stamp every slice with its immutable bind owner.
+  uint64_t generation{0};
+  uint64_t scan_instance_id{0};
 };
 
 //===----------------------------------------------------------------------===//
