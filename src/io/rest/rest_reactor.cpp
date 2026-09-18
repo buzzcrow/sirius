@@ -59,6 +59,16 @@ void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
   while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
 }
 
+std::size_t latency_bucket(std::uint64_t ns) noexcept
+{
+  std::size_t bucket = 0;
+  while (ns > 1 && bucket + 1 < rest_latency_histogram_buckets) {
+    ns >>= 1U;
+    ++bucket;
+  }
+  return bucket;
+}
+
 // ---- libcurl callbacks -----------------------------------------------------
 
 /// Write callback: copy curl's bytes into the sink's destination buffer at the
@@ -861,6 +871,12 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
     _perf.blocking_host_get_wall_ns_total.load(std::memory_order_relaxed);
   s.blocking_host_get_wall_ns_max =
     _perf.blocking_host_get_wall_ns_max.load(std::memory_order_relaxed);
+  for (std::size_t i = 0; i < rest_latency_histogram_buckets; ++i) {
+    s.chunk_get_latency_histogram[i] =
+      _perf.chunk_get_latency_histogram[i].load(std::memory_order_relaxed);
+  }
+  s.active_get_requests = _perf.active_get_requests.load(std::memory_order_relaxed);
+  s.peak_active_get_requests = _perf.peak_active_get_requests.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -1018,7 +1034,14 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &sink));
 
     auto const t0     = std::chrono::steady_clock::now();
+    if (_config.perf_instrumentation) {
+      auto const active = _perf.active_get_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+      atomic_max_relaxed(_perf.peak_active_get_requests, active);
+    }
     CURLcode const rc = curl_easy_perform(h.get());
+    if (_config.perf_instrumentation) {
+      _perf.active_get_requests.fetch_sub(1, std::memory_order_relaxed);
+    }
     long status       = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
 
@@ -1055,6 +1078,8 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
           _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
           _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          _perf.chunk_get_latency_histogram[latency_bucket(get_ns)].fetch_add(
+            1, std::memory_order_relaxed);
           std::uint64_t expected = 0;
           _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
         }
@@ -1550,6 +1575,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         s.token = std::move(tok);  // slot holds its token while in use
         setup_easy(s);
         curl_multi_add_handle(multi.get(), s.easy.get());
+        if (_config.perf_instrumentation) {
+          auto const active = _perf.active_get_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+          atomic_max_relaxed(_perf.peak_active_get_requests, active);
+        }
         ++inflight;
       }
     };
@@ -1611,6 +1640,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
           _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          _perf.chunk_get_latency_histogram[latency_bucket(get_ns)].fetch_add(
+            1, std::memory_order_relaxed);
           std::uint64_t expected = 0;
           _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
           if (req.perf_blocking_host_get) {
@@ -1719,6 +1750,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
         int const i = static_cast<int>(reinterpret_cast<intptr_t>(priv));
         curl_multi_remove_handle(multi.get(), h);
+        if (_config.perf_instrumentation) {
+          _perf.active_get_requests.fetch_sub(1, std::memory_order_relaxed);
+        }
         --inflight;
         // finish() returns true when it parked the slot in `copying` (device
         // H2D in flight) — poll_copy_completions recycles it once the event
@@ -1798,6 +1832,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     for (auto& s : slots) {
       if (s.req) {
         curl_multi_remove_handle(multi.get(), s.easy.get());
+        if (_config.perf_instrumentation) {
+          _perf.active_get_requests.fetch_sub(1, std::memory_order_relaxed);
+        }
         s.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
         s.reset();
       }

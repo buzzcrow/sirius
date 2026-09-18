@@ -755,6 +755,10 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
     CHECK(snapshot.h2d_observed_ns_total == 0);
     CHECK(snapshot.h2d_observed_ns_max == 0);
     CHECK(snapshot.ttfb_ns == 0);
+    CHECK(snapshot.chunk_get_p50_ns == 0);
+    CHECK(snapshot.chunk_get_p95_ns == 0);
+    CHECK(snapshot.active_get_requests == 0);
+    CHECK(snapshot.peak_active_get_requests == 0);
     CHECK(snapshot.device_stream_sync_total == 0);
     CHECK(snapshot.retries_total == 0);
     CHECK(snapshot.terminal_failures_total == 0);
@@ -783,6 +787,10 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
     CHECK(snapshot.h2d_observed_ns_max > 0);
     CHECK(snapshot.h2d_observed_ns_max <= snapshot.h2d_observed_ns_total);
     CHECK(snapshot.ttfb_ns > 0);
+    CHECK(snapshot.chunk_get_p50_ns > 0);
+    CHECK(snapshot.chunk_get_p95_ns >= snapshot.chunk_get_p50_ns);
+    CHECK(snapshot.active_get_requests == 0);
+    CHECK(snapshot.peak_active_get_requests >= 1);
     CHECK(snapshot.device_stream_sync_total == 0);
     CHECK(snapshot.retries_total == 0);
     CHECK(snapshot.terminal_failures_total == 0);
@@ -892,6 +900,10 @@ TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3
   CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
   CHECK(snapshot.queue_wait_ns_total > 0);
   CHECK(snapshot.ttfb_ns > 0);
+  CHECK(snapshot.chunk_get_p50_ns > 0);
+  CHECK(snapshot.chunk_get_p95_ns >= snapshot.chunk_get_p50_ns);
+  CHECK(snapshot.active_get_requests == 0);
+  CHECK(snapshot.peak_active_get_requests >= 1);
   CHECK(snapshot.retries_total == 0);
   CHECK(snapshot.terminal_failures_total == 0);
   CHECK(snapshot.device_stream_sync_total == 0);
@@ -986,6 +998,16 @@ TEST_CASE("bound parquet data-page refuses a replacement ETag",
   input.gpu_memory_space = gpu_space;
   CHECK_THROWS_WITH(ingestible->materialize_table(input, stream.view()),
                     Catch::Matchers::Contains("S3 version conflict"));
+  // Runtime D5 accounting is bind-local and remains observational even when
+  // the version guard rejects the data page; it must not feed a retry or a
+  // second footer/data read.
+  auto const metering = bound->metering.snapshot();
+  CHECK(metering.materialization_attempts == 1);
+  CHECK(metering.materialization_successes == 0);
+  CHECK(metering.materialization_failures == 1);
+  CHECK(metering.materialized_row_groups > 0);
+  CHECK(metering.materialized_compressed_read_budget_bytes > 0);
+  CHECK(metering.materialized_decode_working_budget_bytes > 0);
 }
 
 TEST_CASE("concurrent old and new S3 range generations stay isolated",

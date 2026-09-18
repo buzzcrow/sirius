@@ -29,6 +29,25 @@
 
 namespace sirius::io::rest {
 
+namespace {
+
+std::uint64_t histogram_percentile_upper_bound(
+  std::array<std::uint64_t, rest_latency_histogram_buckets> const& histogram,
+  std::uint64_t sample_count,
+  std::uint64_t percentile) noexcept
+{
+  if (sample_count == 0) { return 0; }
+  auto const target = (sample_count * percentile + 99) / 100;
+  std::uint64_t seen = 0;
+  for (std::size_t i = 0; i < histogram.size(); ++i) {
+    seen += histogram[i];
+    if (seen >= target) { return std::uint64_t{1} << i; }
+  }
+  return std::uint64_t{1} << (histogram.size() - 1);
+}
+
+}  // namespace
+
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
   : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
       return std::make_unique<rest_reactor>(ctx, std::format("rest-{}", i++));
@@ -60,7 +79,17 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
     agg.blocking_host_get_wall_ns_max =
       std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
+    for (std::size_t i = 0; i < agg.chunk_get_latency_histogram.size(); ++i) {
+      agg.chunk_get_latency_histogram[i] += s.chunk_get_latency_histogram[i];
+    }
+    agg.active_get_requests += s.active_get_requests;
+    agg.peak_active_get_requests =
+      std::max(agg.peak_active_get_requests, s.peak_active_get_requests);
   }
+  agg.chunk_get_p50_ns =
+    histogram_percentile_upper_bound(agg.chunk_get_latency_histogram, agg.chunk_get_count, 50);
+  agg.chunk_get_p95_ns =
+    histogram_percentile_upper_bound(agg.chunk_get_latency_histogram, agg.chunk_get_count, 95);
   return agg;
 }
 

@@ -20,11 +20,13 @@
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "scan/parquet_footer_summary.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/s3_container.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cudf/io/parquet.hpp>
 #include <duckdb.hpp>
 
 #include <cstdint>
@@ -199,6 +201,11 @@ rest_ioctx* require_rest_ioctx_for(sirius_scan_manager& manager, std::string con
 
 std::uint64_t chunk_get_count(rest_ioctx const& ctx) { return ctx.perf_snapshot().chunk_get_count; }
 
+std::uint64_t saturating_delta(std::uint64_t after, std::uint64_t before)
+{
+  return after >= before ? after - before : 0;
+}
+
 parquet_bind_result describe_with_counter(sirius_scan_manager& manager,
                                           std::string const& uri,
                                           std::uint64_t& delta)
@@ -244,6 +251,82 @@ TEST_CASE("describe_parquet routes S3 parquet through rest_ioctx and returns nat
   REQUIRE(datasource != nullptr);
   CHECK(result.object_size == datasource->size());
   CHECK(result.object_size > 0);
+}
+
+TEST_CASE("S3 bind budgets and physical data bytes remain separately observable",
+          "[s3][integration][describe_parquet][metering]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const uri    = parquet_uri(bucket, "nation.parquet");
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_minio_rest_config(/*perf_instrumentation=*/true), *fixture.memory, fixture.topology};
+  auto* rest = require_rest_ioctx_for(manager, uri);
+
+  auto const before_bind = rest->perf_snapshot();
+  auto bound             = manager.describe_parquet(uri);
+  auto const after_bind  = rest->perf_snapshot();
+  auto const bind_payload_bytes =
+    saturating_delta(after_bind.payload_bytes_read_total, before_bind.payload_bytes_read_total);
+  auto const bind_gets = saturating_delta(after_bind.chunk_get_count, before_bind.chunk_get_count);
+
+  REQUIRE(bound.footer_summary != nullptr);
+  REQUIRE_FALSE(bound.footer_summary->row_groups.empty());
+  CHECK(bind_gets == 1);  // one suffix Range GET supplies bind/version evidence
+  CHECK(bind_payload_bytes > 0);
+  CHECK(after_bind.chunk_get_p50_ns > 0);
+  CHECK(after_bind.chunk_get_p95_ns >= after_bind.chunk_get_p50_ns);
+  CHECK(after_bind.active_get_requests == 0);
+  CHECK(after_bind.peak_active_get_requests >= 1);
+
+  std::uint64_t projected_budget_bytes = 0;
+  for (std::size_t row_group = 0; row_group < bound.footer_summary->row_groups.size(); ++row_group) {
+    projected_budget_bytes += sirius::scan::estimate_projected_row_group(
+                                *bound.footer_summary,
+                                row_group,
+                                /*projected_top_level_columns=*/1,
+                                bound.names.size())
+                                .compressed_read_bytes;
+  }
+  CHECK(projected_budget_bytes > 0);
+
+  // Read one projected column through the bound size/ETag datasource.  The
+  // footer budget is intentionally not asserted equal to transport bytes:
+  // page layout, range coalescing and cache state are backend details.  Both
+  // values must remain observable, non-zero facts for the same bound object.
+  auto source = rest->open_datasource(uri, bound.object_size, bound.validation_etag);
+  REQUIRE(source != nullptr);
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  sources.push_back(source->duplicate());
+  std::vector<cudf::io::parquet::FileMetaData> metadata;
+  metadata.push_back(*bound.file_metadata);
+  auto options = cudf::io::parquet_reader_options::builder()
+                   .column_names({bound.names.front()})
+                   .build();
+
+  auto const before_data = rest->perf_snapshot();
+  auto [table, ignored_metadata] =
+    cudf::io::read_parquet(std::move(sources), std::move(metadata), options);
+  (void)ignored_metadata;
+  auto const after_data = rest->perf_snapshot();
+  auto const data_payload_bytes =
+    saturating_delta(after_data.payload_bytes_read_total, before_data.payload_bytes_read_total);
+  auto const data_gets = saturating_delta(after_data.chunk_get_count, before_data.chunk_get_count);
+
+  REQUIRE(table != nullptr);
+  CHECK(table->num_rows() == static_cast<cudf::size_type>(bound.total_num_rows));
+  CHECK(table->num_columns() == 1);
+  CHECK(data_gets > 0);
+  CHECK(data_payload_bytes > 0);
+  INFO("bind_payload_bytes=" << bind_payload_bytes
+                              << " projected_budget_bytes=" << projected_budget_bytes
+                              << " data_payload_bytes=" << data_payload_bytes
+                              << " bind_gets=" << bind_gets << " data_gets=" << data_gets
+                              << " bind_p50_ns=" << after_bind.chunk_get_p50_ns
+                              << " bind_p95_ns=" << after_bind.chunk_get_p95_ns
+                              << " peak_active_gets=" << after_data.peak_active_get_requests);
 }
 
 TEST_CASE("describe_parquet reports stable row counts for multiple S3 parquet objects",

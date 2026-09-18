@@ -29,6 +29,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -155,6 +156,8 @@ class rest_io_object : public sirius_io_object {
 /// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
 /// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
 /// payload-bytes counts are populated regardless.
+inline constexpr std::size_t rest_latency_histogram_buckets = 64;
+
 struct rest_perf_snapshot {
   std::uint64_t chunk_get_ns_total{0};
   std::uint64_t chunk_get_count{0};
@@ -178,6 +181,22 @@ struct rest_perf_snapshot {
   std::uint64_t blocking_host_get_count{0};
   std::uint64_t blocking_host_get_wall_ns_total{0};
   std::uint64_t blocking_host_get_wall_ns_max{0};
+  /// Log2-nanosecond histogram of successful Range GET wall time.  A bucket
+  /// represents [2^n, 2^(n+1)) ns (the last bucket is saturated).  It is
+  /// instrumentation-gated and permits pool-level percentile estimates
+  /// without retaining per-request samples.
+  std::array<std::uint64_t, rest_latency_histogram_buckets> chunk_get_latency_histogram{};
+  /// Upper-bound estimates from @c chunk_get_latency_histogram, aggregated
+  /// across all reactors by rest_ioctx.  Zero means no successful samples.
+  std::uint64_t chunk_get_p50_ns{0};
+  std::uint64_t chunk_get_p95_ns{0};
+  /// Number of active REST GET attempts at snapshot time and the high-water
+  /// mark for one reactor. rest_ioctx sums @c active_get_requests across its
+  /// reactors and takes the maximum per-reactor peak (it does not claim a
+  /// globally time-aligned peak). Both are instrumentation-gated; retries are
+  /// separate attempts, while a completed attempt decrements current.
+  std::uint64_t active_get_requests{0};
+  std::uint64_t peak_active_get_requests{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -389,6 +408,10 @@ class rest_reactor {
     std::atomic<std::uint64_t> blocking_host_get_count{0};
     std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
     std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
+    std::array<std::atomic<std::uint64_t>, rest_latency_histogram_buckets>
+      chunk_get_latency_histogram{};
+    std::atomic<std::uint64_t> active_get_requests{0};
+    std::atomic<std::uint64_t> peak_active_get_requests{0};
   };
   perf_counters _perf;
 
