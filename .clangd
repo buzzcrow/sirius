@@ -64,3 +64,16 @@ Diagnostics:
     # The NVHPC version of _NVCXX_EXPAND_PACK macro triggers this clang error.
     # Temporarily suppressing it, but should probably fix
     - "template_param_shadow"
+
+---
+
+# Keep test and benchmark translation units out of clangd's diagnostics and
+# background index while retaining the project compilation database for
+# Sirius, DuckDB, and cuCascade sources.
+If:
+  PathMatch: .*/(test|benchmark)(/.*)?$
+Index:
+  Background: Skip
+Diagnostics:
+  Suppress:
+    - "*"
