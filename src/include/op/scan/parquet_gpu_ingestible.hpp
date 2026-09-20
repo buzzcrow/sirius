@@ -35,6 +35,7 @@
 #include <cudf/io/parquet.hpp>
 
 // standard library
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -104,8 +105,12 @@ class parquet_ingestible_table_info : public ingestible_table_info {
     for (auto const& column : column_ids) {
       if (!column.HasPrimaryIndex()) { continue; }
       auto const id = column.GetPrimaryIndex();
-      if (column.IsVirtualColumn() && id != duckdb::COLUMN_IDENTIFIER_ROW_ID &&
-          id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
+      if ((column.IsVirtualColumn() || std::any_of(virtual_columns.begin(),
+                                                   virtual_columns.end(),
+                                                   [id](auto const& virtual_column) {
+                                                     return virtual_column.column_id == id;
+                                                   })) &&
+          id != duckdb::COLUMN_IDENTIFIER_ROW_ID && id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
         return true;
       }
     }

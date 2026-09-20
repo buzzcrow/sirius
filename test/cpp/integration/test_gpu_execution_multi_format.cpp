@@ -179,6 +179,11 @@ class MultiFormatFixtureBase {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+    REQUIRE(gpu_result->names == cpu_result->names);
+    REQUIRE(gpu_result->types.size() == cpu_result->types.size());
+    for (duckdb::idx_t c = 0; c < gpu_result->types.size(); ++c) {
+      CHECK(gpu_result->types[c] == cpu_result->types[c]);
+    }
 
     // Build a per-column flag for which columns are floating-point.
     std::vector<bool> col_is_float(gpu_result->ColumnCount());
@@ -2149,4 +2154,122 @@ TEST_CASE_METHOD(MultiFormatFixtureBase,
   compare_gpu_vs_cpu("SELECT n_nationkey, file_row_number FROM read_parquet('" + path +
                      "') WHERE file_row_number BETWEEN 3 AND 7 "
                      "AND n_nationkey >= 4 ORDER BY file_row_number");
+}
+
+class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
+ public:
+  ParquetVirtualColumnFixture() : scratch{"parquet_virtual_columns"}
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+
+    write(writer,
+          "a.parquet",
+          "SELECT * FROM (VALUES (10::INTEGER, 'A0'), (NULL, 'A1'), (30, 'A2'), "
+          "(40, 'A3')) t(x, sentinel)");
+    write(writer,
+          "b.parquet",
+          "SELECT * FROM (VALUES (50::INTEGER, 'B0'), (60, 'B1'), (NULL, 'B2')) "
+          "t(x, sentinel)");
+    write(
+      writer, "strings.parquet", "SELECT * FROM (VALUES ('alpha'), (NULL), ('你好')) t(payload)");
+    write(writer,
+          "physical_names.parquet",
+          "SELECT * FROM (VALUES ('physical-a', 7::UBIGINT, 9::BIGINT), "
+          "('physical-b', 8::UBIGINT, 10::BIGINT)) "
+          "t(filename, file_index, file_row_number)");
+    write(
+      writer, "empty.parquet", "SELECT 1::INTEGER AS x, 'none'::VARCHAR AS sentinel WHERE false");
+    write(writer,
+          "utf8/数据.parquet",
+          "SELECT * FROM (VALUES (70::INTEGER, 'U0'), (80, 'U1')) t(x, sentinel)");
+  }
+
+  std::string files(std::string const& first  = "a.parquet",
+                    std::string const& second = "b.parquet") const
+  {
+    return "read_parquet([" + scratch.file_literal(first) + ", " + scratch.file_literal(second) +
+           "], hive_partitioning=false)";
+  }
+
+  std::string file(std::string const& path) const
+  {
+    return "read_parquet(" + scratch.file_literal(path) + ", hive_partitioning=false)";
+  }
+
+  sirius::test::scratch_dir scratch;
+
+ private:
+  void write(duckdb::Connection& writer, std::string const& relative_path, std::string const& query)
+  {
+    fs::create_directories((scratch.path() / relative_path).parent_path());
+    auto result = writer.Query("COPY (" + query + ") TO " + scratch.file_literal(relative_path) +
+                               " (FORMAT PARQUET)");
+    INFO(relative_path);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  }
+};
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns preserve bound file and row provenance",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + files() +
+                     " ORDER BY file_index, file_row_number");
+  compare_gpu_vs_cpu("SELECT file_row_number, x, filename, file_index, filename FROM " + files() +
+                     " ORDER BY file_index, file_row_number");
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + files() +
+                     " WHERE x >= 30 ORDER BY file_index, file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns participate in complete residual predicates",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT sentinel, x FROM " + files() +
+                     " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index FROM " + files() +
+                     " WHERE file_index = 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, filename FROM " + files() +
+                     " WHERE filename LIKE '%b.parquet' ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
+                     " WHERE x IS NULL ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
+                     " WHERE x IS NOT NULL ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, x, file_row_number FROM " + files() +
+                     " WHERE x >= 30 AND file_row_number >= 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, x, file_row_number FROM " + files() +
+                     " WHERE x IS NULL OR file_row_number = 0 ORDER BY sentinel");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual-only carriers and physical name collisions remain distinct",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("strings.parquet") + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("physical_names.parquet") + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + file("empty.parquet"));
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + files() +
+                     " WHERE false");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns support downstream expressions and legacy star options",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, count(*) FROM " + files() +
+                     " GROUP BY filename ORDER BY filename");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number + 10 AS shifted FROM " + files() +
+                     " ORDER BY shifted, sentinel LIMIT 4");
+  compare_gpu_vs_cpu("SELECT * FROM " + file("a.parquet") + " ORDER BY x NULLS LAST");
+  compare_gpu_vs_cpu(
+    "SELECT * FROM read_parquet(" + scratch.file_literal("a.parquet") +
+    ", hive_partitioning=false, filename=true, file_row_number=true) ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number, sentinel FROM " +
+                     file("utf8/数据.parquet") + " ORDER BY file_row_number");
 }

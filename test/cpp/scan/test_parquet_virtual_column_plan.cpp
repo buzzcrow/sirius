@@ -122,3 +122,83 @@ TEST_CASE("parquet scan plan rejects an unknown bound virtual id",
                                         definitions),
                   duckdb::NotImplementedException);
 }
+
+TEST_CASE("parquet scan plan classifies execution sentinels before bound virtual metadata",
+          "[scan][parquet][virtual_columns][scan_plan][sentinel]")
+{
+  for (auto const sentinel : {duckdb::COLUMN_IDENTIFIER_EMPTY, duckdb::COLUMN_IDENTIFIER_ROW_ID}) {
+    auto const plan = scan::build_scan_plan(
+      {duckdb::ColumnIndex(sentinel)}, {}, {"x", "text"}, physical_types(), 1, {}, {});
+
+    CHECK(plan.virtual_columns.empty());
+    CHECK(plan.output_layout.empty());
+    REQUIRE(plan.batch_position_by_column_id.size() == 1);
+    CHECK_FALSE(plan.batch_position_by_column_id[0].has_value());
+    // The sentinel still needs a narrow physical carrier for the row count.
+    REQUIRE(plan.carrier_batch_index.has_value());
+    CHECK(plan.data_columns[*plan.carrier_batch_index].primary_idx == 0);
+  }
+}
+
+TEST_CASE("parquet scan plan does not classify same-named physical columns as virtual",
+          "[scan][parquet][virtual_columns][scan_plan][identity]")
+{
+  auto const plan = scan::build_scan_plan({duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)},
+                                          {},
+                                          {"filename", "file_index"},
+                                          physical_types(),
+                                          2,
+                                          {},
+                                          parquet_virtuals());
+
+  CHECK(plan.virtual_columns.empty());
+  REQUIRE(plan.data_columns.size() == 2);
+  CHECK(plan.data_columns[0].primary_idx == 0);
+  CHECK(plan.data_columns[1].primary_idx == 1);
+  REQUIRE(plan.output_layout.size() == 2);
+  CHECK(plan.output_layout[0].idx == 0);
+  CHECK(plan.output_layout[1].idx == 1);
+}
+
+TEST_CASE("parquet scan plan requires bound metadata with the exact virtual type",
+          "[scan][parquet][virtual_columns][scan_plan][identity]")
+{
+  auto const filename = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+
+  SECTION("missing bound metadata")
+  {
+    CHECK_THROWS_AS(scan::build_scan_plan({duckdb::ColumnIndex(filename)},
+                                          {},
+                                          {"x"},
+                                          {sirius::logical_type::make(sirius::type_id::INTEGER)},
+                                          1,
+                                          {},
+                                          {}),
+                    duckdb::NotImplementedException);
+  }
+  SECTION("wrong bound type")
+  {
+    std::vector<scan::bound_virtual_column> definitions{
+      {filename, "filename", sirius::logical_type::make(sirius::type_id::BIGINT)}};
+    CHECK_THROWS_AS(scan::build_scan_plan({duckdb::ColumnIndex(filename)},
+                                          {},
+                                          {"x"},
+                                          {sirius::logical_type::make(sirius::type_id::INTEGER)},
+                                          1,
+                                          {},
+                                          definitions),
+                    duckdb::NotImplementedException);
+  }
+}
+
+TEST_CASE("parquet scan plan preserves duplicate physical outputs without duplicate reads",
+          "[scan][parquet][virtual_columns][scan_plan][assembly]")
+{
+  auto const plan = scan::build_scan_plan(
+    {duckdb::ColumnIndex(0)}, {0, 0}, {"x", "text"}, physical_types(), 2, {}, {});
+
+  REQUIRE(plan.data_columns.size() == 1);
+  REQUIRE(plan.output_layout.size() == 2);
+  CHECK(plan.output_layout[0].idx == 0);
+  CHECK(plan.output_layout[1].idx == 0);
+}

@@ -165,6 +165,11 @@ struct bound_virtual_column {
   duckdb::column_t column_id;
   std::string name;
   sirius::logical_type type;
+  /// DuckDB's named legacy options expose their generated columns through
+  /// ordinary schema positions rather than the high-bit virtual IDs.  Keep the
+  /// canonical provenance kind at the bind boundary so both representations
+  /// follow the same M-space layout and synthesis path.
+  std::optional<scan_plan::parquet_virtual_column_kind> kind;
 };
 
 //===--------------------------------------------------------------------===//

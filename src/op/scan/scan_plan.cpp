@@ -321,7 +321,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
 
   auto handle_position = [&](std::size_t column_ids_pos, bool is_output) {
     auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) {
+    auto const definition  = virtual_by_id.find(primary_idx);
+    if (duckdb::IsVirtualColumn(primary_idx) || definition != virtual_by_id.end()) {
       // DuckDB's count/empty markers are execution sentinels, not
       // user-visible parquet virtual columns. They may also be present in the
       // advertised virtual map, so classify them before consulting it.
@@ -329,7 +330,6 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
           primary_idx == duckdb::COLUMN_IDENTIFIER_EMPTY) {
         return;
       }
-      auto const definition = virtual_by_id.find(primary_idx);
       if (definition == virtual_by_id.end()) {
         throw duckdb::NotImplementedException("parquet scan: unsupported virtual column id %llu",
                                               static_cast<unsigned long long>(primary_idx));
@@ -338,7 +338,9 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       auto [it, inserted] = virtual_to_ordinal.emplace(primary_idx, plan.virtual_columns.size());
       if (inserted) {
         scan_plan::parquet_virtual_column_kind kind;
-        if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+        if (definition->second->kind) {
+          kind = *definition->second->kind;
+        } else if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
           kind = scan_plan::parquet_virtual_column_kind::FILENAME;
         } else if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
           kind = scan_plan::parquet_virtual_column_kind::FILE_INDEX;
@@ -409,6 +411,11 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       handle_position(projection_ids[i], is_output_position(i, output_types_size));
     }
   }
+
+  // Legacy named options have ordinary primary indices, so the usual
+  // high-bit-ID projection detector cannot see that their schema entries must
+  // be removed from the parquet reader request.
+  plan.needs_reader_projection = plan.needs_reader_projection || !plan.virtual_columns.empty();
 
   // A virtual-only scan still needs a physical row-count carrier. Prefer the
   // narrowest fixed-width column, then VARCHAR; unlike count(*) it cannot keep
