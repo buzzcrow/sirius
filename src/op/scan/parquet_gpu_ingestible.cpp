@@ -35,12 +35,14 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -555,11 +557,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       }
       _duckdb_filter_expression = std::move(duckdb_expression);
 
-      // A virtual predicate cannot be translated against parquet footer
-      // columns, but independent physical TableFilterSet entries are top-level
-      // AND conjuncts and remain safe for row-group pruning. Keep the full
-      // expression as the post-synthesis residual and build a physical-only
-      // stats candidate when necessary.
+      // Keep virtual predicates for the residual; prune only on physical conjuncts.
       std::shared_ptr<duckdb::Expression> stats_candidate = _duckdb_filter_expression;
       if (_has_virtual_filter) {
         duckdb::TableFilterSet physical_filters;
@@ -580,8 +578,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       }
 
       if (stats_candidate && !is_unsafe_for_stats_filter(*stats_candidate)) {
-        // Nothing to strip — push the whole predicate, sharing it rather than
-        // copying.
         _static_pushdown_expression = std::move(stats_candidate);
       } else if (stats_candidate) {
         _static_pushdown_is_complete = false;
@@ -884,10 +880,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
-  // Metadata pruning is independent from reader row filtering. Virtual scans
-  // must not hand set_filter to the data decode (the synthesized columns do
-  // not exist there), but a physical-only stats expression is still safe and
-  // useful against the footer here.
+  // Virtual columns are not available to the reader, but physical footer pruning is.
   if (ast_expression) {
     auto const rgs_before = row_group_indices.size();
     row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
@@ -1221,11 +1214,24 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+  auto append_virtuals = [&](std::unique_ptr<cudf::table> decoded,
+                             std::string const& file_path,
+                             std::size_t file_index,
+                             std::int64_t file_row_offset) {
+    if (_plan->carrier_batch_index && !split.reader_options->get_column_names().has_value()) {
+      auto const rows = decoded->num_rows();
+      decoded.reset();
+      cudf::numeric_scalar<int8_t> value(0, true, stream, mr_ref);
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr_ref));
+      decoded = std::make_unique<cudf::table>(std::move(columns));
+    }
+    return append_parquet_virtual_columns(
+      std::move(decoded), *_plan, file_path, file_index, file_row_offset, stream, mr_ref);
+  };
   std::unique_ptr<cudf::table> table;
   if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
-    // Correctness baseline: decode one selected row group at a time in explicit
-    // split order. This avoids depending on an undocumented multi-source output
-    // ordering contract while provenance columns are being synthesized.
+    // Preserve provenance without relying on multi-source output order.
     auto const layout     = build_batch_layout(split);
     std::size_t run_index = 0;
     std::vector<std::unique_ptr<cudf::table>> pieces;
@@ -1244,13 +1250,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
           throw sirius::internal_exception(
             "parquet virtual scan: decoded row count does not match footer");
         }
-        pieces.push_back(append_parquet_virtual_columns(std::move(decoded),
-                                                        *_plan,
-                                                        run.data_file_path,
-                                                        run.file_index,
-                                                        run.file_row_offset,
-                                                        stream,
-                                                        mr_ref));
+        pieces.push_back(append_virtuals(
+          std::move(decoded), run.data_file_path, run.file_index, run.file_row_offset));
       }
     }
     if (run_index != layout.size()) {
@@ -1277,8 +1278,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     table = std::move(decoded);
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();
-      table             = append_parquet_virtual_columns(
-        std::move(table), *_plan, slice.file_path, slice.file_index, 0, stream, mr_ref);
+      table             = append_virtuals(std::move(table), slice.file_path, slice.file_index, 0);
     }
   }
 

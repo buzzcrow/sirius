@@ -185,10 +185,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
-    // The `filename=true` and `file_row_number=true` options predate DuckDB's
-    // high-bit virtual-column IDs. Their generated output is represented by a
-    // normal primary schema position, so normalize it into the same explicit
-    // provenance metadata used for direct virtual references.
+    // Legacy options use ordinary schema positions; normalize them here.
     auto add_legacy_virtual = [&](duckdb::idx_t primary_idx,
                                   sirius::op::scan::scan_plan::parquet_virtual_column_kind kind) {
       if (primary_idx >= scan_op.names.size() || primary_idx >= scan_op.returned_types.size()) {
@@ -207,11 +204,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
                          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
     }
-    // Unlike `filename`, the legacy `file_row_number=true` position is not
-    // retained in reader_bind. It is appended to the final bind schema while
-    // GetVirtualColumns still advertises the canonical high-bit identity.
-    // Distinguish that generated position from a same-named physical column by
-    // consulting the initial parquet reader's physical schema.
+    // Identify the row-number option from the initial reader, not by name alone.
     bool legacy_file_row_number = false;
     if (bind_data.initial_reader) {
       legacy_file_row_number =

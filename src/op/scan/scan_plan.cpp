@@ -127,6 +127,10 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
                                                             rmm::device_async_resource_ref mr)
 {
   if (!table || plan.virtual_columns.empty()) { return table; }
+  if (static_cast<std::size_t>(table->num_columns()) != plan.data_columns.size()) {
+    throw sirius::internal_exception(
+      "parquet virtual scan: decoded column count does not match planned layout");
+  }
   auto const rows                                    = table->num_rows();
   std::vector<std::unique_ptr<cudf::column>> columns = table->release();
   columns.reserve(columns.size() + plan.virtual_columns.size());
@@ -308,8 +312,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   // emitted. When projection_ids is empty, column_ids is both the read list
   // and the output (no pure-filter columns).
   //
-  // Materialization is deduplicated here. Output requests are recorded
-  // separately below, so `SELECT filename, filename` still has arity two.
+  // Read once; preserve duplicate outputs.
   std::unordered_map<std::size_t, std::size_t> primary_to_batch;  // P → D
   std::unordered_map<std::size_t, std::size_t> primary_to_partition;
   std::unordered_map<duckdb::column_t, std::size_t> virtual_to_ordinal;
@@ -323,9 +326,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
     auto const definition  = virtual_by_id.find(primary_idx);
     if (duckdb::IsVirtualColumn(primary_idx) || definition != virtual_by_id.end()) {
-      // DuckDB's count/empty markers are execution sentinels, not
-      // user-visible parquet virtual columns. They may also be present in the
-      // advertised virtual map, so classify them before consulting it.
+      // Count and empty markers are execution sentinels, not user columns.
       if (primary_idx == duckdb::COLUMN_IDENTIFIER_ROW_ID ||
           primary_idx == duckdb::COLUMN_IDENTIFIER_EMPTY) {
         return;
@@ -412,19 +413,15 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   }
 
-  // Legacy named options have ordinary primary indices, so the usual
-  // high-bit-ID projection detector cannot see that their schema entries must
-  // be removed from the parquet reader request.
+  // Legacy virtual columns use ordinary primary indices and still need projection.
   plan.needs_reader_projection = plan.needs_reader_projection || !plan.virtual_columns.empty();
 
-  // A virtual-only scan still needs a physical row-count carrier. Prefer the
-  // narrowest fixed-width column, then VARCHAR; unlike count(*) it cannot keep
-  // a natural-width read because virtual M positions must be deterministic.
+  // Virtual-only scans need one physical column to establish row count.
   if (plan.data_columns.empty() && !names.empty() && returned_types.size() == names.size()) {
     std::optional<std::size_t> carrier;
     std::size_t carrier_width = 0;
     for (std::size_t p = 0; p < returned_types.size(); ++p) {
-      if (plan.partition_primary_indices.count(p) > 0) { continue; }
+      if (plan.partition_primary_indices.count(p) > 0 || virtual_by_id.contains(p)) { continue; }
       if (!returned_types[p].is_fixed_width()) { continue; }
       auto const width = returned_types[p].fixed_width_byte_size();
       if (width > 0 && (!carrier || width < carrier_width)) {
@@ -434,7 +431,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
     if (!carrier && !plan.virtual_columns.empty()) {
       for (std::size_t p = 0; p < returned_types.size(); ++p) {
-        if (plan.partition_primary_indices.count(p) == 0 &&
+        if (plan.partition_primary_indices.count(p) == 0 && !virtual_by_id.contains(p) &&
             returned_types[p].id() == sirius::type_id::VARCHAR) {
           carrier = p;
           break;
@@ -449,7 +446,11 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   }
 
-  // D is now final. Assign virtual columns to the trailing part of M.
+  if (plan.has_user_virtual_columns() && plan.data_columns.empty()) {
+    throw duckdb::NotImplementedException(
+      "parquet virtual scan: no supported physical row-count carrier");
+  }
+
   for (std::size_t v = 0; v < plan.virtual_columns.size(); ++v) {
     plan.virtual_columns[v].materialized_idx = plan.data_columns.size() + v;
   }
@@ -468,16 +469,11 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   }
 
-  // Build the C → M map. An entry is nullopt when the column is a hive
-  // partition or simply not referenced by projection_ids.
   plan.batch_position_by_column_id.assign(column_ids.size(), std::nullopt);
   for (std::size_t c = 0; c < column_ids.size(); ++c) {
     auto const primary_idx = column_ids[c].GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) {
-      auto it = virtual_to_ordinal.find(primary_idx);
-      if (it != virtual_to_ordinal.end()) {
-        plan.batch_position_by_column_id[c] = plan.virtual_columns.at(it->second).materialized_idx;
-      }
+    if (auto it = virtual_to_ordinal.find(primary_idx); it != virtual_to_ordinal.end()) {
+      plan.batch_position_by_column_id[c] = plan.virtual_columns.at(it->second).materialized_idx;
       continue;
     }
     auto it = primary_to_batch.find(primary_idx);

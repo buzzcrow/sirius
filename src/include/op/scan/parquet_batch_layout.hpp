@@ -19,7 +19,7 @@ class parquet_split_info;
 
 inline constexpr std::size_t invalid_parquet_file_index = std::numeric_limits<std::size_t>::max();
 
-/** One contiguous run of decoded parquet rows and its source provenance. */
+/// Decoded rows and their source-file offsets.
 struct batch_row_run {
   std::string data_file_path;
   int64_t file_row_offset{0};
@@ -28,10 +28,7 @@ struct batch_row_run {
   std::size_t file_index{invalid_parquet_file_index};
 };
 
-/**
- * Build and validate row provenance for a parquet split. File offsets include
- * pruned row groups, while batch offsets do not.
- */
+/// File offsets include pruned row groups; batch offsets do not.
 [[nodiscard]] std::vector<batch_row_run> build_batch_layout(parquet_split_info const& split);
 
 }  // namespace sirius::op::scan
