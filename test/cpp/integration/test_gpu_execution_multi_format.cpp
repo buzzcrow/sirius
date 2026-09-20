@@ -2184,6 +2184,16 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
     write(writer,
           "utf8/数据.parquet",
           "SELECT * FROM (VALUES (70::INTEGER, 'U0'), (80, 'U1')) t(x, sentinel)");
+    write(writer,
+          "hive/part=A/a.parquet",
+          "SELECT * FROM (VALUES (10::INTEGER, 'HA0'), (30, 'HA1')) t(x, sentinel)");
+    write(writer,
+          "hive/part=B/b.parquet",
+          "SELECT * FROM (VALUES (50::INTEGER, 'HB0'), (60, 'HB1')) t(x, sentinel)");
+    write(writer,
+          "keys.parquet",
+          "SELECT * FROM (VALUES (30::INTEGER, true), (60::INTEGER, true), "
+          "(999::INTEGER, false)) t(x, keep)");
   }
 
   std::string files(std::string const& first  = "a.parquet",
@@ -2196,6 +2206,12 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
   std::string file(std::string const& path) const
   {
     return "read_parquet(" + scratch.file_literal(path) + ", hive_partitioning=false)";
+  }
+
+  std::string hive_files() const
+  {
+    return "read_parquet(" + scratch.file_literal("hive/part=*/*.parquet") +
+           ", hive_partitioning=true)";
   }
 
   sirius::test::scratch_dir scratch;
@@ -2272,4 +2288,85 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
     ", hive_partitioning=false, filename=true, file_row_number=true) ORDER BY file_row_number");
   compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number, sentinel FROM " +
                      file("utf8/数据.parquet") + " ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns compose with hive partition injection and pruning",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][hive]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT part, sentinel, file_row_number, filename, file_index, filename FROM " + hive_files() +
+    " WHERE x >= 30 ORDER BY part, sentinel");
+  compare_gpu_vs_cpu("SELECT file_index, part, sentinel, file_row_number FROM " + hive_files() +
+                     " WHERE part = 'B' ORDER BY sentinel");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns survive a published dynamic join filter",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]"
+                 "[dynamic_filter]")
+{
+  con->Query("SET gpu_execution = false");
+  sirius::test::disabled_optimizers_guard shape(
+    *con, "statistics_propagation,join_order,build_side_probe_side");
+  sirius::test::coverage_gate_disable_guard coverage_guard(*con);
+  con->Query("SET gpu_execution = true");
+  auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  compare_gpu_vs_cpu(
+    "SELECT p.filename, p.file_index, p.file_row_number, p.sentinel "
+    "FROM " +
+    files() + " p JOIN (SELECT x FROM " + file("keys.parquet") +
+    " WHERE keep) AS build ON p.x = build.x "
+    "ORDER BY p.sentinel");
+  auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  CHECK(after.producers_enabled > before.producers_enabled);
+  CHECK(after.publications_finished > before.publications_finished);
+  CHECK(after.membership_filters_built > before.membership_filters_built);
+  CHECK(after.filters_pushed > before.filters_pushed);
+}
+
+class ParquetVirtualMultiRowGroupFixture : public MultiFormatFixtureBase {
+ public:
+  ParquetVirtualMultiRowGroupFixture() : scratch{"parquet_virtual_multi_rg"}
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    auto const path = scratch.file_literal("multi.parquet");
+    auto result     = writer.Query(
+      "COPY (SELECT i::INTEGER AS x, ('R' || i)::VARCHAR AS sentinel FROM range(6144) t(i) "
+          "ORDER BY i) TO " +
+      path + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+
+    auto layout = writer.Query("SELECT row_group_id, row_group_num_rows FROM parquet_metadata(" +
+                               path + ") WHERE path_in_schema = 'x' ORDER BY row_group_id");
+    REQUIRE(layout);
+    REQUIRE_FALSE(layout->HasError());
+    REQUIRE(layout->RowCount() == 3);
+    for (duckdb::idx_t i = 0; i < layout->RowCount(); ++i) {
+      REQUIRE(layout->GetValue(1, i).GetValue<std::int64_t>() == 2048);
+    }
+  }
+
+  std::string scan() const
+  {
+    return "read_parquet(" + scratch.file_literal("multi.parquet") + ", hive_partitioning=false)";
+  }
+
+  sirius::test::scratch_dir scratch;
+};
+
+TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
+                 "parquet virtual row numbers retain offsets across pruned row groups",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][pruning]")
+{
+  con->Query("SET gpu_execution = false");
+  sirius::test::scoped_setting force_one_rg_per_split(*con, "scan_task_batch_size", 1024);
+  con->Query("SET gpu_execution = true");
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + scan() +
+                     " WHERE x IN (0, 2048, 4096, 6143) ORDER BY x");
+  compare_gpu_vs_cpu("SELECT x, sentinel, file_row_number FROM " + scan() +
+                     " WHERE x >= 4096 ORDER BY x");
 }

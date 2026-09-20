@@ -884,7 +884,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
-  if (ast_expression && !disable_filter_pushdown) {
+  // Metadata pruning is independent from reader row filtering. Virtual scans
+  // must not hand set_filter to the data decode (the synthesized columns do
+  // not exist there), but a physical-only stats expression is still safe and
+  // useful against the footer here.
+  if (ast_expression) {
     auto const rgs_before = row_group_indices.size();
     row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
     SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Row group pruning {}: {} -> {} row group(s)",

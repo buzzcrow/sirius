@@ -172,6 +172,27 @@ TEST_CASE("build_batch_layout preserves bound file indexes independently of slic
   CHECK(layout[1].batch_row_offset == 2);
 }
 
+TEST_CASE("build_batch_layout retains file offsets when one file spans multiple splits",
+          "[scan][parquet][virtual_columns][batch_layout]")
+{
+  auto const footer   = footer_with({2, 3, 4});
+  auto first          = slice_of("a.parquet", {2, 3, 4}, {0}, 7);
+  auto last           = slice_of("a.parquet", {2, 3, 4}, {2}, 7);
+  first.file_metadata = footer;
+  last.file_metadata  = footer;
+
+  auto const first_layout = build_batch_layout(split_of({std::move(first)}));
+  auto const last_layout  = build_batch_layout(split_of({std::move(last)}));
+  REQUIRE(first_layout.size() == 1);
+  REQUIRE(last_layout.size() == 1);
+  CHECK(first_layout.front().file_index == 7);
+  CHECK(first_layout.front().file_row_offset == 0);
+  CHECK(first_layout.front().batch_row_offset == 0);
+  CHECK(last_layout.front().file_index == 7);
+  CHECK(last_layout.front().file_row_offset == 5);
+  CHECK(last_layout.front().batch_row_offset == 0);
+}
+
 TEST_CASE("build_batch_layout rejects incomplete or inconsistent provenance metadata",
           "[scan][parquet][virtual_columns][batch_layout]")
 {
