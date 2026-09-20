@@ -991,7 +991,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance append-only matches pyiceberg",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // The baseline. No evolution, no deletes — so if this ever declines, the gate has begun
   // over-refusing. It is also the case that proves the delete-gate probe can read a table
@@ -1004,6 +1004,41 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     "SELECT id, name FROM " + pinned_scan(conf_append_only_path) + " ORDER BY id;",
     gpu_route::gpu,
     {{"1", "a"}, {"2", "b"}, {"3", "c"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - append-only virtual columns preserve source positions",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  require_session_can_read(conf_append_only_path);
+  REQUIRE(delete_file_count(conf_append_only_path) == 0);
+  auto const filename =
+    "test/cpp/integration/data/iceberg_conformance/append_only/conf/append_only/data/"
+    "00000-0-b4630554-9751-49f1-b362-c0c9ea9535b3.parquet";
+  expect_iceberg_rows(
+    "SELECT id, name, filename, file_row_number FROM " + pinned_scan(conf_append_only_path) +
+      " ORDER BY id;",
+    gpu_route::gpu,
+    {{"1", "a", filename, "0"}, {"2", "b", filename, "1"}, {"3", "c", filename, "2"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - file_index follows the binder support boundary",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  auto const query = "SELECT file_index FROM " + pinned_scan(v1_path) + ";";
+  std::string gpu_error;
+  std::string cpu_error;
+  for (auto const gpu_enabled : {true, false}) {
+    con->Query(std::string{"SET gpu_execution = "} + (gpu_enabled ? "true;" : "false;"));
+    auto result = con->Query(query);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    CHECK(error.find("Referenced column \"file_index\" not found") != std::string::npos);
+    (gpu_enabled ? gpu_error : cpu_error) = error;
+  }
+  CHECK(gpu_error == cpu_error);
 }
 
 // `y` was dropped and re-added under the same name, so it is a NEW field id (4). The one
@@ -1197,12 +1232,28 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   require_delete_files(v2_path, 1);
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(v2_path) + " ORDER BY count;",
                       kPositionalDeleteRoute,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - positional deletes retain original row positions",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  require_delete_files(v2_path, 1);
+  auto const filename =
+    "test/cpp/integration/data/iceberg_v2_delete/data/"
+    "00000-0-b2c3d4e5-0002-0002-0002-000000000001-00001.parquet";
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(v2_path) + " ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1", filename, "0"},
+                       {"cherry", "3", filename, "2"},
+                       {"elderberry", "5", filename, "4"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1265,13 +1316,22 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes filter on surviving rows",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   require_delete_files(eq_path, 1);
-  expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
-    kEqualityDeleteRoute,
-    {{"cherry", "3"}, {"elderberry", "5"}});
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
+                      kEqualityDeleteRoute,
+                      {{"cherry",
+                        "3",
+                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                        "2"},
+                       {"elderberry",
+                        "5",
+                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                        "4"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -1325,27 +1385,36 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes all rows deleted",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // The delete file covers every data row — an all-false mask, which is where an
   // apply_boolean_mask that mishandles the empty result shows up.
   require_delete_files(all_del_path, 1);
   expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(all_del_path) + ";", kEqualityDeleteRoute, {});
+    "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";",
+    kEqualityDeleteRoute,
+    {});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality and positional deletes combined",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // Both delete kinds against one table. The positional delete removes row 0 (apple/1). The
   // equality delete sits at the same sequence number as the data, so per the Iceberg spec it
   // does NOT apply — deletes only affect data files with strictly lower sequence numbers.
   // banana/2 surviving is the assertion that the sequence-number rule is honoured.
   require_delete_files(combined_path, 2);
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(combined_path) + " ORDER BY count;",
+  auto const filename =
+    "test/cpp/integration/data/iceberg_v2_eq_pos_combined/data/"
+    "00000-0-a7b8c9d0-0007-0007-0007-000000000001-00001.parquet";
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(combined_path) + " ORDER BY count;",
                       kEqualityDeleteRoute,
-                      {{"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+                      {{"banana", "2", filename, "1"},
+                       {"cherry", "3", filename, "2"},
+                       {"date", "4", filename, "3"},
+                       {"elderberry", "5", filename, "4"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
@@ -1401,15 +1470,24 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
                  "gpu_execution iceberg - V3 deletion vector filter",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // A filter over the surviving rows: a deleted row must not reappear because a predicate
   // happens to select it.
   require_delete_files(dv_path, 1);
-  expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(dv_path) + " WHERE count > 2 ORDER BY count;",
-    kDeletionVectorRoute,
-    {{"cherry", "3"}, {"elderberry", "5"}});
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(dv_path) + " WHERE count > 2 ORDER BY count;",
+                      kDeletionVectorRoute,
+                      {{"cherry",
+                        "3",
+                        "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+                        "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet",
+                        "2"},
+                       {"elderberry",
+                        "5",
+                        "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+                        "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet",
+                        "4"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -2286,8 +2364,39 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
   compare_gpu_vs_cpu(
     "SELECT * FROM read_parquet(" + scratch.file_literal("a.parquet") +
     ", hive_partitioning=false, filename=true, file_row_number=true) ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT source_path, sentinel FROM read_parquet(" +
+                     scratch.file_literal("a.parquet") +
+                     ", hive_partitioning=false, filename='source_path') ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT filename, source_path, file_row_number FROM read_parquet(" +
+                     scratch.file_literal("physical_names.parquet") +
+                     ", hive_partitioning=false, filename='source_path') ORDER BY file_row_number");
   compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number, sentinel FROM " +
                      file("utf8/数据.parquet") + " ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet legacy virtual options preserve binder collision errors",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  for (auto const& [option, expected_error] : std::vector<std::pair<std::string, std::string>>{
+         {"filename=true", "Option filename adds column \"filename\""},
+         {"file_row_number=true", "Using file_row_number option on file with column named"}}) {
+    auto const query = "SELECT * FROM read_parquet(" +
+                       scratch.file_literal("physical_names.parquet") +
+                       ", hive_partitioning=false, " + option + ");";
+    std::string gpu_error;
+    std::string cpu_error;
+    for (auto const gpu_enabled : {true, false}) {
+      con->Query(std::string{"SET gpu_execution = "} + (gpu_enabled ? "true;" : "false;"));
+      auto result = con->Query(query);
+      REQUIRE(result);
+      REQUIRE(result->HasError());
+      auto const error = result->GetError();
+      CHECK(error.find(expected_error) != std::string::npos);
+      (gpu_enabled ? gpu_error : cpu_error) = error;
+    }
+    CHECK(gpu_error == cpu_error);
+  }
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
