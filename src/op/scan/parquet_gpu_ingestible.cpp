@@ -481,6 +481,23 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   return entries;
 }
 
+bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
+{
+  for (auto const& column : column_ids) {
+    if (!column.HasPrimaryIndex()) { continue; }
+    auto const id = column.GetPrimaryIndex();
+    if ((column.IsVirtualColumn() || std::any_of(virtual_columns.begin(),
+                                                 virtual_columns.end(),
+                                                 [id](auto const& virtual_column) {
+                                                   return virtual_column.column_id == id;
+                                                 })) &&
+        id != duckdb::COLUMN_IDENTIFIER_ROW_ID && id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
+      return true;
+    }
+  }
+  return false;
+}
+
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//
@@ -1121,6 +1138,27 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 //===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
+std::unique_ptr<cudf::table> parquet_gpu_ingestible::append_virtual_columns(
+  std::unique_ptr<cudf::table> decoded,
+  cudf::io::parquet_reader_options const& reader_options,
+  std::string const& file_path,
+  std::size_t file_index,
+  std::int64_t file_row_offset,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  if (_plan->carrier_batch_index && !reader_options.get_column_names().has_value()) {
+    auto const rows = decoded->num_rows();
+    decoded.reset();
+    cudf::numeric_scalar<int8_t> value(0, true, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+    decoded = std::make_unique<cudf::table>(std::move(columns));
+  }
+  return append_parquet_virtual_columns(
+    std::move(decoded), *_plan, file_path, file_index, file_row_offset, stream, mr);
+}
+
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
@@ -1214,21 +1252,6 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto append_virtuals = [&](std::unique_ptr<cudf::table> decoded,
-                             std::string const& file_path,
-                             std::size_t file_index,
-                             std::int64_t file_row_offset) {
-    if (_plan->carrier_batch_index && !split.reader_options->get_column_names().has_value()) {
-      auto const rows = decoded->num_rows();
-      decoded.reset();
-      cudf::numeric_scalar<int8_t> value(0, true, stream, mr_ref);
-      std::vector<std::unique_ptr<cudf::column>> columns;
-      columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr_ref));
-      decoded = std::make_unique<cudf::table>(std::move(columns));
-    }
-    return append_parquet_virtual_columns(
-      std::move(decoded), *_plan, file_path, file_index, file_row_offset, stream, mr_ref);
-  };
   std::unique_ptr<cudf::table> table;
   if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
     // Preserve provenance without relying on multi-source output order.
@@ -1250,8 +1273,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
           throw sirius::internal_exception(
             "parquet virtual scan: decoded row count does not match footer");
         }
-        pieces.push_back(append_virtuals(
-          std::move(decoded), run.data_file_path, run.file_index, run.file_row_offset));
+        pieces.push_back(append_virtual_columns(std::move(decoded),
+                                                *split.reader_options,
+                                                run.data_file_path,
+                                                run.file_index,
+                                                run.file_row_offset,
+                                                stream,
+                                                mr_ref));
       }
     }
     if (run_index != layout.size()) {
@@ -1278,7 +1306,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     table = std::move(decoded);
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();
-      table             = append_virtuals(std::move(table), slice.file_path, slice.file_index, 0);
+      table             = append_virtual_columns(std::move(table),
+                                     *split.reader_options,
+                                     slice.file_path,
+                                     slice.file_index,
+                                     0,
+                                     stream,
+                                     mr_ref);
     }
   }
 
