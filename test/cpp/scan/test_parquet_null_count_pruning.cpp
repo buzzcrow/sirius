@@ -226,7 +226,7 @@ TEST_CASE_METHOD(NullCountFixture,
   auto ingestible = scan::make_ingestible(std::move(info));
   auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
   REQUIRE(task);
   auto file_info = task();
   auto* file     = dynamic_cast<scan::parquet_file_scan_info*>(file_info.get());
