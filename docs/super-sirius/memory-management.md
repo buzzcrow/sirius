@@ -68,6 +68,15 @@ mount_paths;                    // directories for spill files
 memory_capacity = 1TB;          // total spill capacity
 ```
 
+## Parquet scan working sets
+
+Scan admission uses the mode recorded before prefetch. Ordinary virtual-column reader splits budget selected rows before filtering: physical/virtual buffers, reader provenance and filtered copies, row-number cast, source lookup/dictionary construction, selection scratch, filename characters/offsets and scalar buffers. Physical owners move into the materialized table. This mode has no per-row-group pieces/whole-table concatenation, but filter copies still require a coexistence allowance; removing the old concat floor does not imply halving memory.
+
+Metadata-only splits reserve synthesized carrier/virtual/partition columns, dictionary repetition scratch, row-sequence pieces and their concatenated row column where needed, plus residual-selection coexistence. Their compressed-byte estimate and explicit data prefetch are zero; their working set is not. Empty virtual outputs now construct typed empty columns without scalars; the existing empty-completion reservation retains a small conservative allowance. Filename estimates include possible 64-bit offsets when a combined split crosses the threshold. Iceberg retains its existing multi-run concatenation floor.
+
+The coalescer and `parquet_split_info::estimated_working_set_bytes()` use the same source/read mode. New size products and sums saturate on overflow. Actual peak-allocation checks run through the GPU memory-space allocator, which is also installed as the current cuDF resource so auxiliary allocations are observed.
+
+
 ## Memory Reservations
 
 Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:

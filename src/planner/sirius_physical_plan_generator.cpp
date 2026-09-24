@@ -202,7 +202,9 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
           id, scan_op.names[primary_idx], scan_op.returned_types[primary_idx], kind});
       }
     };
-    if (bind_data.reader_bind.filename_idx.IsValid()) {
+    if (bind_data.reader_bind.filename_idx.IsValid() &&
+        bind_data.reader_bind.filename_idx.GetIndex() !=
+          duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
       add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
                          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
     }

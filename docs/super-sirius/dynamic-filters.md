@@ -80,6 +80,8 @@ DuckDB static filters remain on their existing, authoritative path. Dynamic filt
 
 Membership filtering reduces downstream work but does not avoid scan I/O or decoding. The post-decode `dynamic_filter_gate` measures combined usefulness and can disable ineffective filtering; it also stops individual membership filters whose marginal keep ratio is weak.
 
+Ordinary Parquet virtual-column scans also admit reader AST filters. The resolver maps output O positions through M and accepts only the physical D prefix; a filename, file index, row number or Hive output is not a physical reader column. cuDF adjusts AST positions for its prepend columns internally. A dynamic-only filter or partial static pushdown does not mark the complete static residual as discharged. Any potential dynamic-filter set rules out metadata-only synthesis before metadata tasks run, including filters published later. Iceberg retains its existing delete-related gates.
+
 ## Filter selection
 
 The publisher emits at most one membership representation per admitted key and may additionally emit a zone map:

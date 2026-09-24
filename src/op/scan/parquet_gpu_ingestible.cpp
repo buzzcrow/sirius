@@ -31,6 +31,7 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
+#include <op/scan/parquet_source_filter.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -38,6 +39,8 @@
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -46,9 +49,12 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <cuda/std/utility>
 
@@ -249,12 +255,60 @@ std::string strip_file_uri(std::string const& p)
  * safe when they share hive-partition values and the same pushdown decision, so
  * a mismatch on either forces a flush.
  */
+// SchemaElement::operator== deliberately omits logical annotations and repetition.
+// Those are part of our compatibility gate because they can change cuDF output types.
+bool compatible_reader_schema(cudf::io::parquet::FileMetaData const& a,
+                              cudf::io::parquet::FileMetaData const& b)
+{
+  if (a.schema.size() != b.schema.size()) { return false; }
+  for (std::size_t i = 0; i < a.schema.size(); ++i) {
+    auto const& x = a.schema[i];
+    auto const& y = b.schema[i];
+    if (!(x == y) || x.repetition_type != y.repetition_type || x.arrow_type != y.arrow_type ||
+        x.output_as_byte_array != y.output_as_byte_array ||
+        x.logical_type.has_value() != y.logical_type.has_value()) {
+      return false;
+    }
+    if (!x.logical_type) { continue; }
+    auto const& l = *x.logical_type;
+    auto const& r = *y.logical_type;
+    if (l.type != r.type || l.decimal_type.has_value() != r.decimal_type.has_value() ||
+        l.time_type.has_value() != r.time_type.has_value() ||
+        l.timestamp_type.has_value() != r.timestamp_type.has_value() ||
+        l.int_type.has_value() != r.int_type.has_value()) {
+      return false;
+    }
+    if (l.decimal_type && (l.decimal_type->scale != r.decimal_type->scale ||
+                           l.decimal_type->precision != r.decimal_type->precision)) {
+      return false;
+    }
+    if (l.int_type && (l.int_type->bitWidth != r.int_type->bitWidth ||
+                       l.int_type->isSigned != r.int_type->isSigned)) {
+      return false;
+    }
+    if (l.time_type && (l.time_type->unit.type != r.time_type->unit.type ||
+                        l.time_type->isAdjustedToUTC != r.time_type->isAdjustedToUTC)) {
+      return false;
+    }
+    if (l.timestamp_type &&
+        (l.timestamp_type->unit.type != r.timestamp_type->unit.type ||
+         l.timestamp_type->isAdjustedToUTC != r.timestamp_type->isAdjustedToUTC)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          parquet_source_kind source_kind,
+                          parquet_read_mode read_mode)
     : _cap(cap),
+      _read_mode(read_mode),
+      _source_kind(source_kind),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
       _needs_assembly(needs_output_assembly(*_plan))
@@ -283,9 +337,20 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->file_index};
     }
 
-    if (!_slices.empty() && (_partition_values != file->partition_values ||
-                             _disable_pushdown != file->disable_filter_pushdown ||
-                             _run_reader_options != file->reader_options)) {
+    // The multi-source reader requires compatible schemas even for an unused
+    // carrier. Iceberg still reads virtual row groups individually.
+    bool const incompatible_schema =
+      !_slices.empty() && _read_mode == parquet_read_mode::READER &&
+      _source_kind == parquet_source_kind::PLAIN_PARQUET &&
+      (_plan->has_user_virtual_columns() || _plan->carrier_batch_index) &&
+      _slices.front().file_metadata && file->file_metadata &&
+      !compatible_reader_schema(*_slices.front().file_metadata, *file->file_metadata);
+    if (!_slices.empty() &&
+        (incompatible_schema || _partition_values != file->partition_values ||
+         _disable_pushdown != file->disable_filter_pushdown ||
+         (_run_reader_options != file->reader_options &&
+          (!_run_reader_options || !file->reader_options ||
+           _run_reader_options->get_column_names() != file->reader_options->get_column_names())))) {
       emitted.push_back(emit_current());
     }
     _run_reader_options = file->reader_options;
@@ -334,7 +399,8 @@ class parquet_batch_coalescer : public batch_coalescer {
         memory::saturating_add(_acc_working_bytes, cur_working), rg.decode_working_bytes);
       auto const prospective_runs = memory::saturating_add(
         memory::saturating_add(_acc_run_count, cur_rgs.size()), std::size_t{1});
-      auto const prospective_peak = _plan->has_user_virtual_columns() && prospective_runs > 1
+      auto const prospective_peak = _source_kind == parquet_source_kind::ICEBERG &&
+                                        _plan->has_user_virtual_columns() && prospective_runs > 1
                                       ? memory::saturating_mul(prospective_working, std::size_t{2})
                                       : prospective_working;
       bool const byte_cap_hit =
@@ -366,11 +432,36 @@ class parquet_batch_coalescer : public batch_coalescer {
     // _produced_any. Zero splits would mean zero tasks, and pipeline-completion
     // accounting only fires from task completion, hanging the query.
     if (!_produced_any && _empty_split_fallback) {
+      // Empty completion still constructs filename string_scalars. There are
+      // no row-group estimates to carry their device buffers into this split.
+      std::size_t empty_working_bytes = 0;
+      for (auto const& column : _plan->virtual_columns) {
+        if (column.kind == scan_plan::parquet_virtual_column_kind::FILENAME) {
+          empty_working_bytes = memory::saturating_add(
+            empty_working_bytes,
+            estimate_filename_column_size(0, _empty_split_fallback->file_path.size())
+              .working_bytes);
+        }
+      }
+      if (_source_kind == parquet_source_kind::PLAIN_PARQUET &&
+          (_plan->carrier_batch_index ||
+           (_read_mode == parquet_read_mode::METADATA_ONLY && _plan->virtual_columns.empty()))) {
+        empty_working_bytes = memory::saturating_add(empty_working_bytes, sizeof(int8_t));
+      }
+      if (_read_mode == parquet_read_mode::METADATA_ONLY) {
+        for (auto const& column : _plan->virtual_columns) {
+          if (column.kind == scan_plan::parquet_virtual_column_kind::FILE_INDEX) {
+            empty_working_bytes = memory::saturating_add(empty_working_bytes, sizeof(uint64_t));
+          } else if (column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
+            empty_working_bytes = memory::saturating_add(empty_working_bytes, 2 * sizeof(int64_t));
+          }
+        }
+      }
       _slices.emplace_back(_empty_split_fallback->file_metadata,
                            _empty_split_fallback->file_path,
                            std::vector<cudf::size_type>{},
                            /*estimated_output_bytes=*/0,
-                           /*estimated_decode_working_bytes=*/0,
+                           empty_working_bytes,
                            /*reserved_compressed_bytes=*/0,
                            _empty_split_fallback->datasource,
                            _empty_split_fallback->file_index);
@@ -390,6 +481,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
+    split->source_kind             = _source_kind;
+    split->read_mode               = _read_mode;
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
@@ -401,6 +494,8 @@ class parquet_batch_coalescer : public batch_coalescer {
   }
 
   const std::size_t _cap;
+  const parquet_read_mode _read_mode;
+  const parquet_source_kind _source_kind;
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
@@ -467,7 +562,8 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
                                                             std::size_t path_bytes)
 {
-  if (rows == 0) { return {0, 0}; }
+  // The caller constructs the string_scalar even for an empty output column.
+  if (rows == 0) { return {0, path_bytes}; }
   auto const chars = memory::saturating_mul(rows, path_bytes);
   auto const large_offsets =
     cudf::strings::is_large_strings_enabled() &&
@@ -480,7 +576,8 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
   // including its CUDA-only strings_column_factories.cuh in this host translation unit.
   auto const pairs =
     memory::saturating_mul(rows, sizeof(cuda::std::pair<char const*, cudf::size_type>));
-  return {output, memory::saturating_add(output, pairs)};
+  // The scalar owns the path's device buffer throughout column construction.
+  return {output, memory::saturating_add(memory::saturating_add(output, pairs), path_bytes)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -488,7 +585,9 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
 //===----------------------------------------------------------------------===//
 std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
 {
-  if (!file_metadata || !reader_options) { return {}; }
+  if (read_mode == parquet_read_mode::METADATA_ONLY || !file_metadata || !reader_options) {
+    return {};
+  }
   std::vector<fadvise_entry> entries;
   append_fadvise_entry(entries, datasource, [this] {
     std::vector<cudf::size_type> rg_indices;
@@ -503,7 +602,7 @@ std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() 
 
 std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
 {
-  if (!reader_options) { return {}; }
+  if (read_mode == parquet_read_mode::METADATA_ONLY || !reader_options) { return {}; }
   std::vector<fadvise_entry> entries;
   entries.reserve(rg_slices.size());
   for (auto const& slice : rg_slices) {
@@ -544,8 +643,9 @@ std::shared_ptr<parquet_gpu_ingestible> make_ingestible(
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
-parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info)
-  : _info(std::move(info))
+parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info,
+                                               parquet_source_kind source_kind)
+  : _info(std::move(info)), _source_kind(source_kind)
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
@@ -562,13 +662,19 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       "require column names to be provided.");
   }
 
+  bool const allow_metadata_only =
+    _source_kind == parquet_source_kind::PLAIN_PARQUET && !bind.sirius_dynamic_filters;
   _plan = std::make_shared<scan_plan const>(build_scan_plan(bind.column_ids,
                                                             bind.projection_ids,
                                                             bind.names,
                                                             bind.returned_types,
                                                             bind.scan_output_arity,
                                                             bind.partition_indices,
-                                                            bind.virtual_columns));
+                                                            bind.virtual_columns,
+                                                            allow_metadata_only));
+  if (allow_metadata_only && (_plan->carrier_batch_index || _plan->data_columns.empty())) {
+    _read_mode = parquet_read_mode::METADATA_ONLY;
+  }
   for (auto const& column : bind.virtual_columns) {
     _virtual_types.emplace(column.column_id, column.type);
   }
@@ -714,6 +820,35 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _file_paths = bind.resolved_file_paths;
+  for (std::size_t i = 0; i < _file_paths.size(); ++i) {
+    bool keep = true;
+    if (_source_kind == parquet_source_kind::PLAIN_PARQUET && bind.table_filters) {
+      for (auto const& [position, filter] : bind.table_filters->filters) {
+        if (position >= bind.column_ids.size()) { continue; }
+        auto const id     = bind.column_ids[position].GetPrimaryIndex();
+        auto const column = std::find_if(_plan->virtual_columns.begin(),
+                                         _plan->virtual_columns.end(),
+                                         [id](auto const& entry) { return entry.column_id == id; });
+        if (column == _plan->virtual_columns.end() ||
+            column->kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
+          continue;
+        }
+        auto const value  = column->kind == scan_plan::parquet_virtual_column_kind::FILENAME
+                              ? duckdb::Value(_file_paths[i])
+                              : duckdb::Value::UBIGINT(i);
+        auto const result = evaluate_parquet_source_filter(*filter, value);
+        if (result == source_filter_result::NO_MATCH || result == source_filter_result::SQL_NULL) {
+          keep = false;
+          break;
+        }
+      }
+    }
+    if (keep) { _selected_file_indices.push_back(i); }
+  }
+  // One footer-only schema anchor still produces a completion task when every source
+  // is eliminated. It never requests data pages; numbering always uses the original list.
+  _source_selection_empty = _selected_file_indices.empty() && !_file_paths.empty();
+  if (_source_selection_empty) { _selected_file_indices.push_back(0); }
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -724,7 +859,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _source_kind, _read_mode);
 }
 
 //===----------------------------------------------------------------------===//
@@ -732,15 +867,16 @@ std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer(
 //===----------------------------------------------------------------------===//
 bool parquet_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
+  return _next_file_idx.load(std::memory_order_relaxed) >= _selected_file_indices.size();
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
-  auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
+  auto const position = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
+  if (position >= _selected_file_indices.size()) { return nullptr; }
+  auto const idx = _selected_file_indices[position];
 
   // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
@@ -804,16 +940,59 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       sirius_ds->store_metadata(std::make_shared<parquet_metadata>(file_metadata, footer_len));
   }
   auto const& metadata = *file_metadata;
+  if (_source_kind == parquet_source_kind::PLAIN_PARQUET &&
+      (_plan->has_user_virtual_columns() || _read_mode == parquet_read_mode::METADATA_ONLY)) {
+    int64_t rows = 0;
+    for (auto const& group : metadata.row_groups) {
+      if (group.num_rows < 0 || group.num_rows > std::numeric_limits<int64_t>::max() - rows) {
+        throw sirius::internal_exception("parquet footer has invalid or overflowing row counts");
+      }
+      rows += group.num_rows;
+    }
+    if (metadata.num_rows != rows) {
+      throw sirius::internal_exception("parquet footer row count differs from its row groups");
+    }
+  }
 
-  // The carrier is chosen from the bind schema; a file that lacks it (schema
-  // evolution) or has no row groups to resolve it against reads its natural
-  // batch.
+  // Ordinary reader-mode scans choose a carrier from each actual file schema.
+  // Iceberg retains the bind-schema carrier and its natural-batch fallback.
+  bool const metadata_only = _read_mode == parquet_read_mode::METADATA_ONLY;
+  std::optional<std::string> file_carrier;
+  std::size_t file_carrier_width = 0;
+  if (!metadata_only && _source_kind == parquet_source_kind::PLAIN_PARQUET &&
+      _plan->carrier_batch_index && !metadata.row_groups.empty()) {
+    for (auto const& column : metadata.schema) {
+      bool const partition = std::any_of(
+        _plan->partition_primary_indices.begin(),
+        _plan->partition_primary_indices.end(),
+        [&](auto p) { return p < _info->names.size() && _info->names[p] == column.name; });
+      if (partition) { continue; }
+      auto const width = detail::carrier_decoded_width(column);
+      if (width && (!file_carrier || width < file_carrier_width)) {
+        file_carrier       = column.name;
+        file_carrier_width = width;
+      }
+    }
+  }
+  if (!metadata_only && _source_kind == parquet_source_kind::PLAIN_PARQUET &&
+      _plan->carrier_batch_index && !metadata.row_groups.empty() && !file_carrier) {
+    throw duckdb::NotImplementedException(
+      "parquet virtual scan: file has no supported top-level row-count carrier: %s", file_path);
+  }
   bool const carrier_unavailable =
-    _plan->carrier_batch_index.has_value() &&
+    !file_carrier && _plan->carrier_batch_index.has_value() &&
     detail::leaf_indices_for_column(metadata, _plan->data_columns[*_plan->carrier_batch_index].name)
       .empty();
-  if (carrier_unavailable) { opts = *_natural_reader_options; }
-  bool const file_projected = _plan->is_projected() && !carrier_unavailable;
+  auto file_options = _reader_options;
+  if (carrier_unavailable || metadata_only) {
+    file_options = _natural_reader_options;
+  } else if (file_carrier && _reader_options->get_column_names() !=
+                               std::optional<std::vector<std::string>>{{*file_carrier}}) {
+    file_options = std::make_shared<cudf::io::parquet_reader_options>(*_natural_reader_options);
+    file_options->set_column_names({*file_carrier});
+  }
+  opts                      = *file_options;
+  bool const file_projected = _plan->is_projected() && !carrier_unavailable && !metadata_only;
 
   // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
   // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
@@ -839,7 +1018,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       break;
     }
   }
-  bool const disable_filter_pushdown = _plan->has_user_virtual_columns() || stats_filter_unsafe;
+  bool const disable_filter_pushdown =
+    metadata_only ||
+    (_source_kind == parquet_source_kind::ICEBERG && _plan->has_user_virtual_columns()) ||
+    stats_filter_unsafe;
 
   // Translate the filter for reader-side row-group pruning unless disabled. The
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
@@ -864,8 +1046,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // DuckDB schema types (P-space), indexed by scan_plan::data_column::primary_idx.
   // Used below to estimate the decoded (GPU-resident) byte size of each projected
   // column when partitioning row groups into batches — see rg_contribution.
-  auto const& returned_types   = _info->returned_types;
-  auto const data_column_names = _plan->data_column_names();
+  auto const& returned_types = _info->returned_types;
+  auto const data_column_names =
+    file_carrier ? std::vector<std::string>{*file_carrier} : _plan->data_column_names();
   // A file read without its carrier keeps every file column. rg_contribution
   // uses bind-type widths for known, non-partition top-level columns and
   // metadata estimates for the rest; a partition name's bind type is the
@@ -907,7 +1090,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       // types (which throw) get 0, signalling rg_contribution to fall back to
       // the encoded-uncompressed byte size.
       std::size_t decoded_width = 0;
-      if (k < _plan->data_columns.size()) {
+      if (file_carrier) {
+        decoded_width =
+          file_carrier_width == std::numeric_limits<std::size_t>::max() ? 0 : file_carrier_width;
+      } else if (k < _plan->data_columns.size()) {
         auto const primary_idx = _plan->data_columns[k].primary_idx;
         if (primary_idx < returned_types.size()) {
           try {
@@ -929,8 +1115,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
+  if (_source_selection_empty) { row_group_indices.clear(); }
   // Virtual columns are not available to the reader, but physical footer pruning is.
-  if (ast_expression) {
+  if (ast_expression && !row_group_indices.empty()) {
     auto const rgs_before = row_group_indices.size();
     row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
     SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Row group pruning {}: {} -> {} row group(s)",
@@ -1075,7 +1262,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       if (!is_pure_filter) { estimate.output_bytes += decoded_bytes; }
       estimate.compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
     };
-    if (file_projected) {
+    if (metadata_only) {
+      // One INT8 cardinality carrier when D has a carrier, or for count(*) with
+      // no materialized output. No physical column is decoded or prefetched.
+      auto const carrier    = !_plan->data_columns.empty() || _plan->virtual_columns.empty();
+      estimate.output_bytes = carrier ? row_count : 0;
+      estimate.decode_working_bytes = estimate.output_bytes;
+    } else if (file_projected) {
       for (std::size_t i = 0; i < selected_chunk_indices.size(); ++i) {
         auto const chunk_idx = selected_chunk_indices[i];
         add_chunk(row_group.columns[chunk_idx],
@@ -1148,15 +1341,53 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
         estimate.output_bytes = memory::saturating_add(estimate.output_bytes, bytes);
       }
     }
+    if (metadata_only) {
+      // Row sequence pieces can coexist with their concatenated column. Identity
+      // repetition and residual selection also need maps/scratch and output buffers.
+      estimate.decode_working_bytes = memory::saturating_add(
+        memory::saturating_mul(estimate.decode_working_bytes, std::size_t{2}),
+        memory::saturating_mul(row_count, std::size_t{17}));
+    } else if (_source_kind == parquet_source_kind::PLAIN_PARQUET &&
+               _plan->has_user_virtual_columns()) {
+      bool source_index = false;
+      bool row_index    = false;
+      bool filename     = false;
+      for (auto const& column : _plan->virtual_columns) {
+        row_index |= column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+        source_index |= column.kind != scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+        filename |= column.kind == scan_plan::parquet_virtual_column_kind::FILENAME;
+      }
+      // Decode and filtered output may coexist; residual selection can likewise retain M
+      // while copying it. This is a filter-copy budget, not the old row-group concat floor.
+      estimate.decode_working_bytes =
+        memory::saturating_mul(estimate.decode_working_bytes, std::size_t{2});
+      // Reader provenance before/after filtering; selection map + BOOL mask; normalized
+      // carrier. Virtual output (including the INT64 row cast) was charged above.
+      std::size_t const per_row = 2 * (4 * source_index + 8 * row_index) + 8 + 1 +
+                                  (_plan->carrier_batch_index ? 1 : 0) + (filename ? 8 : 0);
+      estimate.decode_working_bytes = memory::saturating_add(
+        estimate.decode_working_bytes, memory::saturating_mul(row_count, per_row));
+      // Source lookup entries, concatenated dictionary, string scalar/pairs/offsets,
+      // and reader offsets. Charge once per RG (conservative when
+      // several RGs share one source); 64-bit filename offsets are covered above even
+      // when only the combined split crosses the large-string threshold.
+      auto const dictionary_bytes =
+        filename
+          ? memory::saturating_add(memory::saturating_mul(file_path.size(), std::size_t{3}), 128)
+          : std::size_t{32};
+      estimate.decode_working_bytes = memory::saturating_add(
+        estimate.decode_working_bytes, memory::saturating_add(dictionary_bytes, 1024));
+    }
     return estimate;
   };
 
   auto out                     = std::make_unique<parquet_file_scan_info>();
   out->file_metadata           = file_metadata;
+  out->read_mode               = _read_mode;
   out->file_path               = file_path;
   out->file_index              = file_index;
   out->datasource              = std::move(sirius_ds);
-  out->reader_options          = carrier_unavailable ? _natural_reader_options : _reader_options;
+  out->reader_options          = std::move(file_options);
   out->carrier_unavailable     = carrier_unavailable;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
@@ -1189,9 +1420,13 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::append_virtual_columns(
   if (_plan->carrier_batch_index && !reader_options.get_column_names().has_value()) {
     auto const rows = decoded->num_rows();
     decoded.reset();
-    cudf::numeric_scalar<int8_t> value(0, true, stream, mr);
     std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+    if (rows == 0) {
+      columns.push_back(cudf::make_empty_column(cudf::type_id::INT8));
+    } else {
+      cudf::numeric_scalar<int8_t> value(0, true, stream, mr);
+      columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+    }
     decoded = std::make_unique<cudf::table>(std::move(columns));
   }
   return append_parquet_virtual_columns(
@@ -1212,6 +1447,267 @@ bool parquet_gpu_ingestible::can_project_during_filter() const noexcept
   }
   return true;
 }
+
+namespace {
+
+// Upload small CPU metadata arrays once; the host storage must remain alive until
+// the copy completes. This wait protects staging lifetime, not a device-value check.
+rmm::device_buffer upload_metadata(void const* data,
+                                   std::size_t bytes,
+                                   ::cuda::stream_ref stream,
+                                   rmm::device_async_resource_ref mr)
+{
+  rmm::device_buffer buffer(data, bytes, stream, mr);
+  stream.sync();
+  return buffer;
+}
+
+template <typename T>
+std::unique_ptr<cudf::column> metadata_column(std::vector<T> const& values,
+                                              cudf::type_id type,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  return std::make_unique<cudf::column>(
+    cudf::data_type{type},
+    static_cast<cudf::size_type>(values.size()),
+    upload_metadata(values.data(), values.size() * sizeof(T), stream, mr),
+    rmm::device_buffer{0, stream, mr},
+    0);
+}
+
+std::unique_ptr<cudf::column> source_dictionary(std::vector<row_group_slice const*> const& sources,
+                                                scan_plan::parquet_virtual_column_kind kind,
+                                                ::cuda::stream_ref stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  if (kind == scan_plan::parquet_virtual_column_kind::FILE_INDEX) {
+    std::vector<uint64_t> values;
+    values.reserve(sources.size());
+    for (auto const* source : sources) {
+      values.push_back(source->file_index);
+    }
+    return metadata_column(values, cudf::type_id::UINT64, stream, mr);
+  }
+  std::vector<int64_t> offsets{0};
+  std::string chars;
+  for (auto const* source : sources) {
+    chars.append(source->file_path);
+    offsets.push_back(static_cast<int64_t>(chars.size()));
+  }
+  // Use wide offsets when the aggregate dictionary crosses cuDF's string threshold.
+  auto offsets_column = [&]() {
+    if (chars.size() >= static_cast<std::size_t>(cudf::strings::get_offset64_threshold())) {
+      return metadata_column(offsets, cudf::type_id::INT64, stream, mr);
+    }
+    std::vector<int32_t> narrow(offsets.begin(), offsets.end());
+    return metadata_column(narrow, cudf::type_id::INT32, stream, mr);
+  }();
+  return cudf::make_strings_column(static_cast<cudf::size_type>(sources.size()),
+                                   std::move(offsets_column),
+                                   upload_metadata(chars.data(), chars.size(), stream, mr),
+                                   0,
+                                   rmm::device_buffer{0, stream, mr});
+}
+
+// No reader runs in this mode. Build constant identities for whole sources,
+// and only build row sequences when the query actually needs original positions.
+std::unique_ptr<cudf::table> synthesize_metadata_rows(scan_plan const& plan,
+                                                      parquet_split_info const& split,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  bool const needs_rows =
+    std::any_of(plan.virtual_columns.begin(), plan.virtual_columns.end(), [](auto const& column) {
+      return column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+    });
+  std::vector<row_group_slice const*> sources;
+  std::vector<cudf::size_type> counts;
+  std::vector<std::pair<int64_t, int64_t>> row_runs;
+  int64_t total_rows = 0;
+  for (auto const& slice : split.rg_slices) {
+    int64_t count            = 0;
+    int64_t offset           = 0;
+    std::size_t prefix_index = 0;
+    auto const first_run     = row_runs.size();
+    for (auto const index : slice.row_group_indices) {
+      auto const rows = slice.file_metadata->row_groups.at(index).num_rows;
+      count += rows;
+      if (needs_rows) {
+        // Only metadata synthesis needs host offsets. The file row counts have
+        // already been validated; reader-mode uses cuDF's original row indices.
+        while (prefix_index < static_cast<std::size_t>(index)) {
+          offset += slice.file_metadata->row_groups[prefix_index++].num_rows;
+        }
+        if (rows > 0) {
+          if (row_runs.size() > first_run &&
+              row_runs.back().first + row_runs.back().second == offset) {
+            row_runs.back().second += rows;
+          } else {
+            row_runs.emplace_back(offset, rows);
+          }
+        }
+      }
+    }
+    if (count > std::numeric_limits<cudf::size_type>::max() - total_rows) {
+      throw sirius::internal_exception("parquet metadata scan exceeds cuDF row capacity");
+    }
+    total_rows += count;
+    if (count > 0) {
+      sources.push_back(&slice);
+      counts.push_back(static_cast<cudf::size_type>(count));
+    }
+  }
+  auto const rows = static_cast<cudf::size_type>(total_rows);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  if (!plan.data_columns.empty() || plan.virtual_columns.empty()) {
+    if (rows == 0) {
+      columns.push_back(cudf::make_empty_column(cudf::type_id::INT8));
+    } else {
+      cudf::numeric_scalar<int8_t> zero(0, true, stream, mr);
+      columns.push_back(cudf::make_column_from_scalar(zero, rows, stream, mr));
+    }
+  }
+  std::unique_ptr<cudf::column> repetitions;
+  for (auto const& column : plan.virtual_columns) {
+    auto const type = column.kind == scan_plan::parquet_virtual_column_kind::FILENAME
+                        ? cudf::type_id::STRING
+                      : column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+                        ? cudf::type_id::INT64
+                        : cudf::type_id::UINT64;
+    if (rows == 0) {
+      columns.push_back(cudf::make_empty_column(type));
+    } else if (column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
+      std::vector<std::unique_ptr<cudf::column>> pieces;
+      std::vector<cudf::column_view> views;
+      cudf::numeric_scalar<int64_t> step(1, true, stream, mr);
+      for (auto const& [offset, count] : row_runs) {
+        cudf::numeric_scalar<int64_t> begin(offset, true, stream, mr);
+        pieces.push_back(
+          cudf::sequence(static_cast<cudf::size_type>(count), begin, step, stream, mr));
+        views.push_back(pieces.back()->view());
+      }
+      columns.push_back(pieces.size() == 1 ? std::move(pieces.front())
+                                           : cudf::concatenate(views, stream, mr));
+    } else if (sources.size() == 1) {
+      if (column.kind == scan_plan::parquet_virtual_column_kind::FILENAME) {
+        cudf::string_scalar value(sources.front()->file_path, true, stream, mr);
+        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+      } else {
+        cudf::numeric_scalar<uint64_t> value(sources.front()->file_index, true, stream, mr);
+        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+      }
+    } else {
+      if (!repetitions) { repetitions = metadata_column(counts, cudf::type_id::INT32, stream, mr); }
+      auto dictionary = source_dictionary(sources, column.kind, stream, mr);
+      auto repeated =
+        cudf::repeat(cudf::table_view{{dictionary->view()}}, repetitions->view(), stream, mr);
+      auto repeated_columns = repeated->release();
+      columns.push_back(std::move(repeated_columns.front()));
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+struct provenance_columns {
+  bool source = false;
+  bool row    = false;
+};
+
+provenance_columns requested_provenance(scan_plan const& plan)
+{
+  provenance_columns result;
+  for (auto const& column : plan.virtual_columns) {
+    result.row |= column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+    result.source |= column.kind != scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+  }
+  return result;
+}
+
+/// R = [optional source, optional row, physical columns]. Move physical owners into M,
+/// then append virtual columns in plan order. The reader-local source dictionary keeps
+/// bound identity even when earlier files or row groups were pruned.
+std::unique_ptr<cudf::table> normalize_provenance(
+  std::unique_ptr<cudf::table> decoded,
+  scan_plan const& plan,
+  std::vector<row_group_slice const*> const& sources,
+  provenance_columns flags,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const rows            = decoded->num_rows();
+  auto input                 = decoded->release();
+  std::size_t physical_start = 0;
+  std::unique_ptr<cudf::column> source;
+  std::unique_ptr<cudf::column> row;
+  auto take_index = [&](cudf::type_id type) {
+    if (physical_start >= input.size() || input[physical_start]->type().id() != type ||
+        input[physical_start]->null_count() != 0) {
+      throw sirius::internal_exception("parquet provenance: unexpected reader index column");
+    }
+    return std::move(input[physical_start++]);
+  };
+  if (flags.source) { source = take_index(cudf::type_id::INT32); }
+  if (flags.row) { row = take_index(cudf::type_id::UINT64); }
+  std::vector<std::unique_ptr<cudf::column>> output;
+  if (plan.carrier_batch_index) {
+    // The unused carrier supplies only cardinality, never a user-visible type.
+    input.clear();
+    if (rows == 0) {
+      output.push_back(cudf::make_empty_column(cudf::type_id::INT8));
+    } else {
+      cudf::numeric_scalar<int8_t> zero(0, true, stream, mr);
+      output.push_back(cudf::make_column_from_scalar(zero, rows, stream, mr));
+    }
+  } else {
+    if (input.size() - physical_start != plan.data_columns.size()) {
+      throw sirius::internal_exception("parquet provenance: physical width differs from scan plan");
+    }
+    for (std::size_t i = physical_start; i < input.size(); ++i) {
+      output.push_back(std::move(input[i]));
+    }
+  }
+  for (auto const& column : plan.virtual_columns) {
+    if (rows == 0) {
+      auto const type = column.kind == scan_plan::parquet_virtual_column_kind::FILENAME
+                          ? cudf::type_id::STRING
+                        : column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER
+                          ? cudf::type_id::INT64
+                          : cudf::type_id::UINT64;
+      output.push_back(cudf::make_empty_column(type));
+      continue;
+    }
+    if (column.kind == scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER) {
+      output.push_back(cudf::cast(row->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr));
+      continue;
+    }
+    if (!source) {
+      if (sources.size() != 1) {
+        throw sirius::internal_exception(
+          "parquet provenance: missing source index for multiple sources");
+      }
+      if (column.kind == scan_plan::parquet_virtual_column_kind::FILENAME) {
+        cudf::string_scalar value(sources.front()->file_path, true, stream, mr);
+        output.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+      } else {
+        cudf::numeric_scalar<uint64_t> value(sources.front()->file_index, true, stream, mr);
+        output.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+      }
+      continue;
+    }
+    auto dictionary = source_dictionary(sources, column.kind, stream, mr);
+    auto gathered   = cudf::gather(cudf::table_view{{dictionary->view()}},
+                                 source->view(),
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 mr);
+    auto columns    = gathered->release();
+    output.push_back(std::move(columns.front()));
+  }
+  return std::make_unique<cudf::table>(std::move(output));
+}
+
+}  // namespace
 
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
@@ -1286,8 +1782,39 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   std::unique_ptr<cudf::table> table;
-  if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
-    // Preserve provenance without relying on multi-source output order.
+  if (split.read_mode == parquet_read_mode::METADATA_ONLY) {
+    if (split.source_kind != parquet_source_kind::PLAIN_PARQUET || _sirius_dynamic_filters ||
+        (!_plan->carrier_batch_index && !_plan->data_columns.empty())) {
+      throw sirius::internal_exception("parquet metadata scan: ineligible split");
+    }
+    table = synthesize_metadata_rows(*_plan, split, stream, mr_ref);
+  } else if (_plan->has_user_virtual_columns() && !all_slices_pruned &&
+             split.source_kind == parquet_source_kind::PLAIN_PARQUET) {
+    auto flags = requested_provenance(*_plan);
+    std::vector<row_group_slice const*> bindings;
+    std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+    std::vector<cudf::io::parquet::FileMetaData> metadatas;
+    std::vector<std::vector<cudf::size_type>> row_groups;
+    for (auto const& slice : split.rg_slices) {
+      if (slice.row_group_indices.empty()) { continue; }
+      bindings.push_back(&slice);
+      sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
+                                         : cudf::io::datasource::create(slice.file_path));
+      metadatas.push_back(*slice.file_metadata);
+      row_groups.push_back(slice.row_group_indices);
+    }
+    // Source identity is constant for a single source, even after filtering.
+    // Original row positions come directly from cuDF, including pruned/filtered reads.
+    if (bindings.size() == 1) { flags.source = false; }
+    opts.enable_prepend_source_index_column(flags.source);
+    opts.enable_prepend_row_index_column(flags.row);
+    opts.set_row_groups(std::move(row_groups));
+    _reader_calls.fetch_add(1, std::memory_order_relaxed);
+    auto result =
+      cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+    table = normalize_provenance(std::move(result.tbl), *_plan, bindings, flags, stream, mr_ref);
+  } else if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
+    // Iceberg retains its contiguous, unfiltered per-row-group provenance contract.
     auto const layout     = build_batch_layout(split);
     std::size_t run_index = 0;
     std::vector<std::unique_ptr<cudf::table>> pieces;
@@ -1300,6 +1827,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
         auto one_opts = *split.reader_options;
         one_opts.set_row_groups({{rg_index}});
+        _reader_calls.fetch_add(1, std::memory_order_relaxed);
         auto [decoded, metadata] = cudf::io::read_parquet(
           std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
         if (decoded->num_rows() != run.num_rows) {
@@ -1347,10 +1875,14 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       rg_per_src.push_back(slice.row_group_indices);
     }
     if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
+    _reader_calls.fetch_add(1, std::memory_order_relaxed);
     auto [decoded, metadata] =
       cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
     table = std::move(decoded);
-    if (_plan->has_user_virtual_columns()) {
+    if (split.source_kind == parquet_source_kind::PLAIN_PARQUET && _plan->carrier_batch_index &&
+        !_plan->has_user_virtual_columns()) {
+      table = normalize_provenance(std::move(table), *_plan, {}, {}, stream, mr_ref);
+    } else if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();
       table             = append_virtual_columns(std::move(table),
                                      *split.reader_options,

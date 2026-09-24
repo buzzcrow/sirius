@@ -25,10 +25,13 @@
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1943,6 +1946,21 @@ TEST_CASE("internal sirius_read_parquet is registered as a one-argument table fu
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).ToString() == "sirius_read_parquet");
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
+
+  con.context->RunFunctionInTransaction([&] {
+    auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
+      *con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "sirius_read_parquet");
+    auto function =
+      entry.functions.GetFunctionByArguments(*con.context, {duckdb::LogicalType::VARCHAR});
+    REQUIRE(function.get_virtual_columns != nullptr);
+    auto const columns = function.get_virtual_columns(*con.context, nullptr);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME).type ==
+          duckdb::LogicalType::VARCHAR);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX).type ==
+          duckdb::LogicalType::UBIGINT);
+    CHECK(columns.at(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER).type ==
+          duckdb::LogicalType::BIGINT);
+  });
 }
 
 TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
@@ -2515,6 +2533,75 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
   auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
                            local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("S3 virtual columns preserve file identity and row positions through both SQL entries",
+          "[s3][integration][sql][virtual_columns]")
+{
+  auto const transparent = GENERATE(false, true);
+  CAPTURE(transparent);
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  // The explicit gpu_execution wrapper must remain a DuckDB table-function
+  // call; its inner SQL is planned by Sirius. Transparent mode plans plain SQL.
+  set_gpu_execution(fixture.con, transparent);
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback = false");
+  auto compare = [&](std::string const& remote_sql, std::string const& local_sql) {
+    if (transparent) {
+      compare_transparent_s3_gpu_to_local_cpu(fixture, remote_sql, local_sql);
+    } else {
+      compare_s3_gpu_to_local_cpu(fixture, remote_sql, local_sql);
+    }
+  };
+  auto const uri    = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const remote = s3_parquet_scan(*env, "nation");
+  auto const local  = local_parquet_scan(*env, "nation");
+  // The CPU oracle reads the identical local fixture. Only the filename is
+  // replaced with the expected S3 URI; row numbers come from native Parquet.
+  auto const expected_prefix =
+    "SELECT " + sql_quote(uri) + " AS filename, file_index, file_row_number, n_nationkey FROM ";
+  auto const actual_prefix = "SELECT filename, file_index, file_row_number, n_nationkey FROM ";
+  for (auto const& condition : {std::string{},
+                                std::string{" WHERE n_nationkey IN (2, 9, 23)"},
+                                std::string{" WHERE file_row_number > 7 AND n_nationkey < 13"},
+                                std::string{" WHERE file_index = 1"}}) {
+    auto const s3_sql  = actual_prefix + remote + condition + " ORDER BY file_row_number";
+    auto const cpu_sql = expected_prefix + local + condition + " ORDER BY file_row_number";
+    compare(s3_sql, cpu_sql);
+  }
+
+  auto const virtual_only = "SELECT file_index, file_row_number FROM ";
+  compare(virtual_only + remote + " ORDER BY file_row_number",
+          virtual_only + local + " ORDER BY file_row_number");
+
+  compare(
+    virtual_only + s3_parquet_scan(*env, "virtual_nested_only") + " ORDER BY file_row_number",
+    virtual_only + local_parquet_scan(*env, "virtual_nested_only") + " ORDER BY file_row_number");
+
+  // A filter-only virtual column must be bound even when no virtual is projected.
+  compare("SELECT n_nationkey FROM " + remote + " WHERE filename = " + sql_quote(uri) +
+            " ORDER BY n_nationkey",
+          "SELECT n_nationkey FROM " + local + " ORDER BY n_nationkey");
+
+  // Non-contiguous groups plus row filtering must preserve file-local positions.
+  auto const provenance_uri = s3_uri(env->bucket, "parquet/virtual_provenance.parquet");
+  auto const predicate = " WHERE (marker < 2048 OR marker >= 6144) AND keep = 1 ORDER BY marker";
+  compare("SELECT filename, file_index, file_row_number, marker FROM " +
+            s3_parquet_scan(*env, "virtual_provenance") + predicate,
+          "SELECT " + sql_quote(provenance_uri) + ", file_index, file_row_number, marker FROM " +
+            local_parquet_scan(*env, "virtual_provenance") + predicate);
+
+  // A physical column sharing a virtual name wins binding, including its type
+  // and null semantics; registration must not replace it with a constant.
+  for (auto const& suffix : {std::string{" ORDER BY marker"},
+                             std::string{" WHERE filename IS NULL ORDER BY marker"},
+                             std::string{" WHERE filename IS NOT NULL ORDER BY marker"}}) {
+    auto const prefix = "SELECT filename, file_index, file_row_number FROM ";
+    compare(prefix + s3_parquet_scan(*env, "virtual_physical_names") + suffix,
+            prefix + local_parquet_scan(*env, "virtual_physical_names") + suffix);
+  }
 }
 
 TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius datasource is off",
@@ -4222,4 +4309,68 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without prefet
     large_lineitem_orders_join_query(s3_large_lineitem_scan(*env), s3_parquet_scan(*env, "orders")),
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
+}
+
+TEST_CASE("S3 metadata-only provenance skips pruned sources and performs no data GETs",
+          "[s3][integration][virtual_columns][metadata_only]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  s3_sql_fixture fixture(*env);
+  namespace scan  = sirius::op::scan;
+  auto const uri  = s3_uri(env->bucket, "parquet/virtual_provenance.parquet");
+  auto& context   = require_sirius_context(fixture);
+  auto datasource = context.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource);
+  auto ioctx = datasource->io_ctx();
+  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(ioctx.get());
+  REQUIRE(rest);
+  auto info                 = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths = {s3_uri(env->bucket, "does-not-exist-pruned.parquet"), uri};
+  info->names               = {"marker", "keep"};
+  info->returned_types      = {sirius::logical_type::make(sirius::type_id::BIGINT),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto const index_id       = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
+  auto const row_id         = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+  info->column_ids          = {duckdb::ColumnIndex(index_id), duckdb::ColumnIndex(row_id)};
+  info->scan_output_arity   = 2;
+  info->virtual_columns     = {
+    {index_id, "file_index", sirius::logical_type::make(sirius::type_id::UBIGINT), std::nullopt},
+    {row_id, "file_row_number", sirius::logical_type::make(sirius::type_id::BIGINT), std::nullopt}};
+  info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->filters.emplace(
+    0,
+    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_EQUAL,
+                                              duckdb::Value::UBIGINT(1)));
+  auto reader = scan::make_ingestible(std::move(info));
+  std::vector<std::string> resolved;
+  auto task = reader->next_split_provider([&](std::string_view path) {
+    resolved.emplace_back(path);
+    return ioctx;
+  });
+  REQUIRE(task);
+  auto file = task();
+  REQUIRE(resolved == std::vector<std::string>{uri});
+  REQUIRE(reader->has_processed_all_metadata());
+  CHECK(file->fadvise_entries().empty());
+  auto coalescer = reader->create_batch_coalescer();
+  CHECK(coalescer->push(std::move(file)).empty());
+  auto splits = coalescer->flush();
+  REQUIRE(splits.size() == 1);
+  CHECK(splits.front()->fadvise_entries().empty());
+  auto const before_data = rest->perf_snapshot();
+  auto const* space =
+    context.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto decoded = reader->materialize_metadata_to_table(
+    *splits.front(), *space, cudf::get_default_stream(), false, nullptr);
+  auto output = reader->post_filter_and_project(
+    std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
+  REQUIRE(output);
+  CHECK(output->num_rows() == 8193);
+  CHECK(reader->reader_calls() == 0);
+  auto const data = delta_snapshot(rest->perf_snapshot(), before_data);
+  CHECK(data.chunk_get_count == 0);
+  CHECK(data.payload_bytes_read_total == 0);
+  CHECK(data.h2d_observed_count == 0);
 }

@@ -87,7 +87,7 @@ std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
 }
 
 iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info)
-  : parquet_gpu_ingestible(std::move(info))
+  : parquet_gpu_ingestible(std::move(info), parquet_source_kind::ICEBERG)
 {
   auto const& bind = static_cast<iceberg_ingestible_table_info const&>(table_info());
   _delete_data     = bind.delete_data;

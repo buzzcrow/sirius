@@ -105,6 +105,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
+    src/op/scan/parquet_source_filter.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
     src/op/scan/iceberg_metadata_reader.cpp

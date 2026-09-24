@@ -49,6 +49,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -284,6 +285,22 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
   return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+}
+
+virtual_column_map_t SiriusReadParquetVirtualColumns(ClientContext&, optional_ptr<FunctionData>)
+{
+  // Match the native Parquet binder's identities and types. These are virtual
+  // bindings, not footer columns: SELECT * and physical name collisions remain
+  // governed by DuckDB's normal table-function binding rules.
+  virtual_column_map_t columns;
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                  TableColumn("filename", LogicalType::VARCHAR));
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX,
+                  TableColumn("file_index", LogicalType::UBIGINT));
+  columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                  TableColumn("file_row_number", LogicalType::BIGINT));
+  columns.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));
+  return columns;
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -2469,6 +2486,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
   sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.get_virtual_columns = SiriusReadParquetVirtualColumns;
   sirius_read_parquet.projection_pushdown = true;
   sirius_read_parquet.filter_pushdown     = true;
   sirius_read_parquet.filter_prune        = true;

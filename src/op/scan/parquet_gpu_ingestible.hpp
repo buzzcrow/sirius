@@ -121,10 +121,15 @@ struct filename_column_size_estimate {
   std::size_t working_bytes;
 };
 
-/// Size the repeated filename column and cuDF's temporary pointer/length pairs.
+/// Size the repeated filename column, temporary pointer/length pairs, and the
+/// scalar's device character buffer (which is constructed even for zero rows).
 /// Uses the active cuDF large-string settings and saturates on overflow.
 [[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
                                                                           std::size_t path_bytes);
+
+/// Iceberg keeps its contiguous row-group/delete-layout contract.
+enum class parquet_source_kind { PLAIN_PARQUET, ICEBERG };
+enum class parquet_read_mode { READER, METADATA_ONLY };
 
 //===----------------------------------------------------------------------===//
 // parquet_split_info
@@ -144,6 +149,8 @@ class parquet_split_info : public scan_info {
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
+  parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET;
+  parquet_read_mode read_mode     = parquet_read_mode::READER;
   /// Shared parquet_reader_options (column projection, filter pushdown
   /// when AST translation succeeded). Shared across every split emitted
   /// by the same batch.
@@ -182,10 +189,11 @@ class parquet_split_info : public scan_info {
       total = memory::saturating_add(total, s.estimated_decode_working_bytes);
       runs  = memory::saturating_add(runs, s.row_group_indices.size());
     }
-    // The provenance-preserving virtual path decodes one table per selected row group. When
-    // several pieces are present they all remain alive while concatenate allocates an equally
-    // sized result, so reserve both sides of that peak.
-    return plan && plan->has_user_virtual_columns() && runs > 1
+    // Iceberg retains the per-row-group virtual path and its pieces/concat peak.
+    // Plain reader and metadata-only modes already charge their different allocation
+    // lifetimes in each row group's decode_working_bytes.
+    return source_kind == parquet_source_kind::ICEBERG && plan &&
+               plan->has_user_virtual_columns() && runs > 1
              ? memory::saturating_mul(total, std::size_t{2})
              : total;
   }
@@ -214,6 +222,7 @@ class parquet_split_info : public scan_info {
  */
 class parquet_file_scan_info : public scan_info {
  public:
+  parquet_read_mode read_mode = parquet_read_mode::READER;
   /// A single pruned row group with the byte accounting the coalescer chunks on.
   /// @c output_bytes estimates the decoded size of projected data columns before
   /// row filtering, while @c decode_working_bytes also includes columns decoded
@@ -253,10 +262,9 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
-  /// When true, the plan's row-count carrier column (scan_plan::carrier_batch_index)
-  /// could not be resolved in this file — schema evolution, or no row groups —
-  /// so @ref reader_options carries no column projection and the file reads its
-  /// natural batch. Splits never mix files that differ on this.
+  /// No projected carrier was resolved (for example an empty footer). Iceberg
+  /// retains its natural-schema fallback; plain nonempty reader files choose their
+  /// own supported carrier or decline. Metadata-only mode does not decode a carrier.
   bool carrier_unavailable = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
@@ -315,9 +323,17 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// Built by @c parquet_ingestible_table_info::make_ingestible. The base
   /// @c _table_info owns the parquet bind data; this constructor casts it
   /// back to @c parquet_ingestible_table_info for typed access.
-  explicit parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info);
+  explicit parquet_gpu_ingestible(
+    std::unique_ptr<parquet_ingestible_table_info> info,
+    parquet_source_kind source_kind = parquet_source_kind::PLAIN_PARQUET);
 
   ~parquet_gpu_ingestible() override;
+
+  /// Data-reader calls made by this ingestible (footer probes excluded).
+  [[nodiscard]] std::size_t reader_calls() const noexcept
+  {
+    return _reader_calls.load(std::memory_order_relaxed);
+  }
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
@@ -384,14 +400,16 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
+  const parquet_source_kind _source_kind;
+  parquet_read_mode _read_mode = parquet_read_mode::READER;
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
   // Shared plan-level projection options. Filters are applied per split.
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
-  // The same options without a column projection: stamped onto files whose
-  // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
+  // Options without projection: footer parsing, metadata-only splits, and the
+  // retained natural-schema fallback. Per-file reader carrier options may differ.
   std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
@@ -431,10 +449,13 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::vector<null_prune_predicate> _null_prune_predicates;
 
   std::vector<std::string> _file_paths;
+  std::vector<std::size_t> _selected_file_indices;
+  bool _source_selection_empty = false;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+  std::atomic<std::size_t> _reader_calls{0};
 
   // Dynamic join filters shared with the producing hash join; null when none are wired.
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in

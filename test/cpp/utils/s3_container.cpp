@@ -47,6 +47,7 @@ bool env_set(char const* name)
 
 #include <curl/curl.h>
 #include <duckdb.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
 extern "C" {
 #include <testcontainers-c/container.h>
@@ -247,6 +248,28 @@ void create_special_key_fixtures(fs::path const& fixture_dir)
   for (auto const& [source, destination] : fixtures) {
     fs::create_directories(destination.parent_path());
     fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+  }
+}
+
+void create_virtual_column_fixtures(fs::path const& fixture_dir)
+{
+  scoped_sirius_disable disable;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  for (auto const& [name, query] : std::vector<std::pair<std::string, std::string>>{
+         {"virtual_provenance",
+          "SELECT range AS marker, (range % 3)::INTEGER AS keep FROM range(8193)"},
+         {"virtual_nested_only", "SELECT [range, range + 1] AS items FROM range(19)"},
+         {"virtual_physical_names",
+          "SELECT range AS marker, CASE WHEN range = 0 THEN NULL ELSE 'physical' END AS filename, "
+          "77::BIGINT AS file_index, 88::INTEGER AS file_row_number FROM range(2)"}}) {
+    auto const path = fixture_dir / "parquet" / (name + ".parquet");
+    auto result     = con.Query("COPY (" + query + ") TO " + sql_literal(path.string()) +
+                            " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    if (!result || result->HasError()) {
+      throw std::runtime_error("failed to generate virtual-column fixture " + name + ": " +
+                               (result ? result->GetError() : "no query result"));
+    }
   }
 }
 
@@ -656,6 +679,7 @@ bool bring_up()
   generate_fixtures(fixture_dir);
   create_special_key_fixtures(fixture_dir);
   create_edge_types_fixture(fixture_dir);
+  create_virtual_column_fixtures(fixture_dir);
 
   // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
   int http_req = make_minio_request();
