@@ -458,7 +458,13 @@ std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ran
 {
   std::vector<std::vector<cudf::io::text::byte_range_info>> per_slice(slices.size());
   for (std::size_t i = 0; i < slices.size(); ++i) {
-    if (!slices[i].file_metadata) { continue; }
+    // The normal Parquet reader discovers its own ranges. Only prefetching and
+    // bulk I/O need these ranges before materialization.
+    if (!slices[i].file_metadata || !slices[i].datasource ||
+        (!slices[i].datasource->uses_prefetching_cache() &&
+         !slices[i].datasource->prefers_bulk_io())) {
+      continue;
+    }
     per_slice[i] =
       column_chunk_ranges(*slices[i].file_metadata, reader_options, slices[i].row_group_indices);
   }
