@@ -56,5 +56,15 @@ TEST_CASE("Local identity observes mtime through the owned fd", "[object_identit
   object_identity held;
   REQUIRE(capture_local_identity(fd, held));
   CHECK(held == changed);
+  // io_uring reopens the owned descriptor for O_DIRECT, so pathname removal
+  // cannot switch the data descriptor to another object.
+  auto proc_path = "/proc/self/fd/" + std::to_string(fd);
+  int reopened   = ::open(proc_path.c_str(), O_RDONLY);
+  REQUIRE(reopened >= 0);
+  object_identity reopened_identity;
+  bool captured = capture_local_identity(reopened, reopened_identity);
+  ::close(reopened);
+  CHECK(captured);
+  CHECK(reopened_identity == held);
   CHECK_FALSE(capture_local_identity(-1, held));
 }

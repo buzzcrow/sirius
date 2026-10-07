@@ -19,32 +19,11 @@
 #include "io/types.hpp"
 
 #include <cstddef>
-#include <functional>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 namespace sirius::io::cache {
-
-namespace detail {
-
-/// Transparent hasher so the store can be looked up by @c std::string_view (or
-/// @c const char*) without materialising a @c std::string.  Paired with
-/// @c std::equal_to<> below, this enables C++20 heterogeneous lookup on the
-/// underlying @c unordered_map — without both, a string_view-taking getter
-/// would just construct a temporary key on every call and be strictly worse
-/// than taking @c std::string const&.
-struct string_hash {
-  using is_transparent = void;
-  [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept
-  {
-    return std::hash<std::string_view>{}(sv);
-  }
-};
-
-}  // namespace detail
 
 /// Per-ioctx access namespace over the process-wide retention manager.
 /// Path-only lookup is a candidate hint, never permission to consume metadata.

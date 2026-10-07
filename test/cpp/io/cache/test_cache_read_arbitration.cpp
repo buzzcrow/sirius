@@ -74,14 +74,18 @@ struct controlled_config {
 
 class controlled_object final : public sirius::io::io_object {
  public:
-  explicit controlled_object(std::string path) : _path(std::move(path)) {}
+  explicit controlled_object(std::string path, std::string version = {})
+    : _path(std::move(path)), _version(std::move(version))
+  {
+  }
 
   [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
   [[nodiscard]] std::size_t size() const noexcept override { return 4 * chunk_size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _version; }
 
  private:
-  std::string _path;
+  std::string _path, _version;
 };
 
 class controlled_reactor {
@@ -423,4 +427,71 @@ TEST_CASE("a cache whose chunk size differs from the reactor staging block is re
   matched->initialize_cache(*memory, config, single_gpu_topology());
   CHECK(matched->cache() != nullptr);
   matched->shutdown_cache();
+}
+
+TEST_CASE("raw cache validates identities across opens", "[cache][object_identity]")
+{
+  cache_fixture fixture;
+  int const mode            = GENERATE(0, 1, 2);  // same version, changed version, no validator
+  std::string const version = mode == 2 ? "" : "v1";
+  auto open                 = [&](std::string tag) {
+    return std::make_unique<sirius::io::sirius_datasource>(
+      fixture.context,
+      std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
+  };
+  fixture.datasource = open(version);
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto fill = fixture.context->reactor().take_next();
+  REQUIRE(fill);
+  complete_success(*fill, 0x5a);
+  auto reopened = open(mode == 1 ? "v2" : version);
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  if (mode != 0) {
+    auto request = fixture.context->reactor().take_next();
+    REQUIRE(request);
+    complete_success(*request, 0x7b);
+  }
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [&](auto b) { return b == (mode == 0 ? 0x5a : 0x7b); }));
+  CHECK(fixture.context->reactor().pending() == 0);
+}
+
+TEST_CASE("a late old raw-cache fill cannot overwrite the new version", "[cache][object_identity]")
+{
+  cache_fixture fixture;
+  auto open = [&](std::string tag) {
+    return std::make_unique<sirius::io::sirius_datasource>(
+      fixture.context,
+      std::make_shared<controlled_object>("controlled://versioned", std::move(tag)));
+  };
+  fixture.datasource = open("v1");
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto old_fill = fixture.context->reactor().take_next();
+  REQUIRE(old_fill);
+  auto old_source    = std::move(fixture.datasource);
+  fixture.datasource = open("v2");
+  fixture.advise(0);
+  REQUIRE(fixture.datasource->prefetch_async([](bool) noexcept {}) ==
+          sirius::io::prefetch_refusal::issued);
+  auto new_fill = fixture.context->reactor().take_next();
+  REQUIRE(new_fill);
+  complete_success(*new_fill, 0x7b);
+  complete_success(*old_fill, 0x5a);
+  auto reopened = open("v2");
+  std::array<std::uint8_t, read_size> bytes{};
+  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x7b; }));
+  read = old_source->host_read_async(0, bytes.size(), bytes.data());
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == bytes.size());
+  CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x5a; }));
+  CHECK(fixture.context->reactor().pending() == 0);
 }

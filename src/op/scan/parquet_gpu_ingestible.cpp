@@ -941,7 +941,14 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
         column.meta_data.codec = cudf::io::parquet::Compression::LZO;
       if (_info->injections.synthetic_parquet_codec == "LZO:first_row_group") break;
     }
-    file_metadata = std::move(copy);
+    resolved_metadata =
+      std::make_shared<parquet_metadata>(std::move(copy),
+                                         footer_len,
+                                         encryption,
+                                         resolved_metadata->original_schema,
+                                         resolved_metadata->arrow_schema,
+                                         resolved_metadata->original_logical_annotations);
+    file_metadata = resolved_metadata->file_metadata();
   }
   if (_info->injections.strip_encryption_evidence) encryption = {};
   auto const& metadata = *file_metadata;

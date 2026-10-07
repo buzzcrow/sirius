@@ -109,10 +109,10 @@ class io_object : public std::enable_shared_from_this<io_object> {
 
   [[nodiscard]] std::string identity_cache_key() const
   {
-    return identity().cache_key(object_path());
+    return identity().cache_key(raw_file_cache_id());
   }
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
+  /// Backend locator used as part of the identity-aware prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
   /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
