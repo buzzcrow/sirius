@@ -22,6 +22,7 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
+#include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/planner/logical_operator.hpp>
@@ -179,4 +180,61 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE(pin->HasError());
   CHECK(pin->GetError().find("encrypted storage is not GPU-decodable") != std::string::npos);
   run_ok("DETACH r2a_encrypted");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU materialized results preserve ordering and outlive their connection",
+                 "[transparent][integration][materialized_collector]")
+{
+  auto const rows   = GENERATE(0, 5000);
+  auto const memory = GENERATE(duckdb::QueryResultMemoryType::IN_MEMORY,
+                               duckdb::QueryResultMemoryType::BUFFER_MANAGED);
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(
+    con->Query("CREATE TABLE collector_rows AS SELECT i FROM range(5000) t(i)")->HasError());
+  run_ok("CHECKPOINT");
+  REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  duckdb::QueryParameters parameters;
+  parameters.memory_type = memory;
+  auto pending           = con->PendingQuery(
+    "SELECT i FROM collector_rows WHERE i < " + std::to_string(rows) + " ORDER BY i DESC",
+    parameters);
+  REQUIRE_FALSE(pending->HasError());
+  auto result = pending->Execute();
+  REQUIRE_FALSE(result->HasError());
+  pending.reset();
+  con.reset();
+  auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+  REQUIRE(materialized.RowCount() == rows);
+  for (int i = 0; i < rows; ++i) {
+    CHECK(materialized.GetValue(0, i).GetValue<int64_t>() == rows - i - 1);
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU materialization respects an embedder result collector",
+                 "[transparent][integration][materialized_collector]")
+{
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TABLE custom_collector_rows AS SELECT 42 AS i")->HasError());
+  run_ok("CHECKPOINT");
+  REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  unsigned calls = 0;
+  auto& callback = duckdb::ClientConfig::GetConfig(*con->context).get_result_collector;
+  auto saved     = callback;
+  struct restore_hook {
+    duckdb::get_result_collector_t& target;
+    duckdb::get_result_collector_t saved;
+    ~restore_hook() { target = std::move(saved); }
+  } restore{callback, saved};
+  callback = [&](duckdb::ClientContext& client, duckdb::PreparedStatementData& data) {
+    ++calls;
+    return duckdb::PhysicalResultCollector::GetResultCollector(client, data);
+  };
+  auto result = con->Query("SELECT sum(i) FROM custom_collector_rows");
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 42);
+  CHECK(calls == 1);
 }

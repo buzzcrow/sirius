@@ -266,10 +266,11 @@ the current generated flags and linked with the same DuckDB static libraries.
 No GPU scan/footer parser is executed in this reproduction. The pinned DuckDB
 materialized collector's global state owns a shared ClientContext, while an
 abandoned context owns its pending executor; initializer scheduling affects when
-this retention appears. This needs separate upstream/lifecycle compatibility
-work, not a test sleep or a claimed R3 cache fix. No third-party source changed.
+this retention appears. The Sirius compatibility fix described below removes the
+cycle from its materialized GPU result path. The pure DuckDB reproduction still
+documents the dependency behavior; no third-party source changed.
 
-### Outstanding acceptance issues
+### Backend boundaries and acceptance follow-ups
 
 1. Remote kvikio lacks a public ETag/conditional-read interface on the installed
    pin; REST known-size opens also carry no validator. Their open-local fallback
@@ -287,10 +288,9 @@ work, not a test sleep or a claimed R3 cache fix. No third-party source changed.
    permit, allocator-exact heap measurement or cap on in-flight parsing/active
    splits. The record ownership and cache-budget bounds must not be presented as
    an RSS limit.
-5. The abandoned PendingQuery lifecycle case above remains failing and blocks
-   full cleanup acceptance. Separating its compatibility work was proposed to
-   the user; deferral has not been assumed approved. Passing focused runs do not
-   override the reproducible failure.
+5. O9 is resolved for Sirius materialized GPU plans by the collector follow-up
+   below. Unmodified CPU-only DuckDB collectors and embedder-supplied collectors
+   retain their own lifecycle behavior; this is not a general DuckDB patch.
 
 
 ### O8 follow-up: retire superseded raw-cache entries
@@ -323,3 +323,34 @@ sanitizer coverage. `ASAN_OPTIONS=detect_leaks=0:protect_shadow_gap=0`,
 ASan startup reported CUDA allocation errors before tests, including a serial
 attempt with ample free VRAM; those attempts are retained as environment failures,
 not test passes. Logs and the instrumented executable are under `runs/r3-followup/`.
+
+
+### O9 follow-up: materialize Sirius results without a context cycle
+
+Sirius now installs a stateless factory through DuckDB's public
+`ClientConfig::get_result_collector` hook when publishing a GPU physical plan,
+unless the caller has already supplied a factory. Only a direct
+`PhysicalSiriusExecution` root uses the new collector; CPU roots delegate to
+DuckDB's normal factory, and streaming selection remains DuckDB's responsibility.
+
+The Sirius source has one execution thread, so its collector appends into one
+ordered collection and snapshots `ClientProperties` by value. It uses the base
+`CreateCollection` API for both in-memory and buffer-managed results. No strong
+ClientContext reference is retained in the sink, eliminating the
+context -> executor -> collector -> context cycle without forced context teardown,
+timers, changes to third-party code, or weakened release assertions.
+
+The original prepared-statement zero-reservation assertions pass, including a
+new section that lets the pending executor initialize before dropping handles
+and then checks weak ClientContext expiry. Empty and 5,000-row ordered outputs,
+both result-memory modes, result lifetime after connection release, and respecting
+an embedder collector are covered. The combined focused run passed 12 cases /
+10,557 assertions with the original failure seed `2090273576`.
+
+
+The complete R3 scan/S3/Iceberg/io_uring/cache regression, with strict managed
+SeaweedFS HTTP/TLS and the physical-profile fixtures, passed 923 cases /
+4,758,551 assertions at the same seed. The broader transparent-execution run
+exposed a separate read-view fixture leak of the database-global optimizer mask;
+that test-isolation issue is handled in its own follow-up, not by weakening the
+regex test's GPU-route expectations.
