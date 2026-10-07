@@ -1368,10 +1368,11 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
               device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
           }
 
-          auto request           = std::make_unique<rest_io_op_request>();
-          request->object        = file->get_object_ref();
-          request->needs_staging = slice.needs_staging();
-          request->logical_bytes = intersect(slice.rng, io_rng).size;
+          auto request            = std::make_unique<rest_io_op_request>();
+          request->object         = file->get_object_ref();
+          request->validation_tag = std::string(file->validation_tag());
+          request->needs_staging  = slice.needs_staging();
+          request->logical_bytes  = intersect(slice.rng, io_rng).size;
           logical_bytes += request->logical_bytes;
           request->op = std::move(op);
           expanded.push_back(std::move(request));

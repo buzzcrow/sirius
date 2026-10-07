@@ -1402,7 +1402,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -3248,7 +3248,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   for (auto const& path : file_paths) {
     auto const cache_key     = normalize_path(path);
     auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
     auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
