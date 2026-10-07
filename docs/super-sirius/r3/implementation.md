@@ -276,14 +276,9 @@ work, not a test sleep or a claimed R3 cache fix. No third-party source changed.
    preserves cache isolation but reduces warm reuse and cannot prove that multiple
    requests observe a remotely mutable object. Ordinary REST footer-probe/HEAD
    opens do capture ETag; these paths must be measured separately.
-2. Raw prefetch file entries own an append-only chunk arena and io_object until
-   cache teardown. Version-aware keys prevent stale-byte reuse but can accumulate
-   old-version index storage and handles; size-only repeated remote opens amplify
-   this. Raw data buffers have their own eviction; the unreclaimed objects are
-   file indexes/chunk descriptors and handles, not every historical byte buffer.
-   Metadata's 1 GiB cap does not cover those indexes. This was raised for
-   a separate lifecycle/retirement task, not silently declared bounded. Safely
-   erasing entries requires protecting asynchronous chunk-pointer users.
+2. O8 is resolved by the raw-cache retirement follow-up below. Metadata's 1 GiB
+   allowance still does not cover raw indexes; one current entry per locator is
+   retained, while active users can temporarily own retired versions.
 3. Local size+mtime is best effort: concurrent in-place changes and preserved
    mtime are not immutable-read guarantees. Sirius io_uring reopens its buffered
    fd via /proc/self/fd for O_DIRECT, avoiding a second pathname-resolution race.
@@ -296,3 +291,35 @@ work, not a test sleep or a claimed R3 cache fix. No third-party source changed.
    full cleanup acceptance. Separating its compatibility work was proposed to
    the user; deferral has not been assumed approved. Passing focused runs do not
    override the reproducible failure.
+
+
+### O8 follow-up: retire superseded raw-cache entries
+
+The user authorized completing the remaining acceptance work. The raw cache now
+keeps one current identity per raw locator in each ioctx. Publishing a different
+identity detaches the previous entry. Requests, exported chunk-vector aliases,
+physical fill callbacks, and cache-hit CUDA retirements retain the old arena until
+their final use. Its last owner returns resident buffers to their originating NUMA
+pool and releases the index, arena, and io_object. Destruction occurs outside the
+map lock. This preserves old-reader correctness without retaining every historical
+version until cache teardown.
+
+The eviction worker drops disposed requests for retired entries independently of
+buffer pressure. It polls every 100 ms only while a superseded request remains
+active; unchanged warm caches keep event-driven maintenance. Current-version raw
+buffer eviction policy is unchanged. Reopening a handle without a validator also
+replaces its old open-local cache entry. This bounds retained *versions per
+locator*, not the total number of distinct locators or memory held by live readers.
+
+Tests cover 24 successive validated and unvalidated opens with no explicit eviction,
+late physical I/O after abandoning its handle, and an intentionally blocked CUDA
+copy on a cache hit without a prefetch handle. Weak io_object ownership and buffer
+counts verify reclamation; existing late-v1/v2 tests verify byte isolation.
+The identity/retirement sanitizer run passed 9 cases / 311 assertions. The raw-cache
+implementation and arbitration test translation units were built with ASan/UBSan
+and linked against the remaining Release objects; this is not whole-program
+sanitizer coverage. `ASAN_OPTIONS=detect_leaks=0:protect_shadow_gap=0`,
+`UBSAN_OPTIONS=halt_on_error=1`, and `CUDA_MODULE_LOADING=LAZY` were used. Default
+ASan startup reported CUDA allocation errors before tests, including a serial
+attempt with ample free VRAM; those attempts are retained as environment failures,
+not test passes. Logs and the instrumented executable are under `runs/r3-followup/`.
