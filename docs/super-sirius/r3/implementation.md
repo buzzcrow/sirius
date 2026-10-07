@@ -354,3 +354,48 @@ SeaweedFS HTTP/TLS and the physical-profile fixtures, passed 923 cases /
 exposed a separate read-view fixture leak of the database-global optimizer mask;
 that test-isolation issue is handled in its own follow-up, not by weakening the
 regex test's GPU-route expectations.
+
+
+### Additional acceptance finding: optimizer-mask test isolation
+
+The expanded transparent regression initially passed 139/140 cases. The regex
+GPU-route assertion failed because an earlier read-view fixture executed
+`RESET disabled_optimizers`, clearing the database-global Sirius optimizer mask
+for later fixtures sharing that database. The log showed an unsupported
+`__internal_compress_integral_utinyint` projection before collector construction;
+the regex case passed alone (71 assertions). No regex/output assertion was relaxed.
+
+`ReadViewFixture` now saves the original optimizer set and restores it on scope
+exit, including assertion unwinding. Its tests can still deliberately reset or
+override the mask within their own scope. Repeating the original transparent
+filter and seed passed 140 cases / 15,510 assertions. The test-only edit was
+compiled and linked using the generated build commands; the already-validated
+production extension was unchanged. Both the failed and fixed runs are retained
+under `runs/r3-followup/`.
+
+
+### Final SF30 comparison after O8/O9
+
+TPC-H SF30 was rerun against exact R2b `ca294edad` and production R3 `b1766ff3`,
+using the same 9-file data, CPU oracle, Release toolchain, integration config,
+16 DuckDB threads, hot/grouped profile, no pinning and disabled CPU fallback.
+Each version executed 22 queries five times; both validated 22/22 with no errors.
+The sum of per-query medians over iterations 1–4 was 15.868405 seconds for R2b
+and 15.909482 for R3 (+0.26%). Max process RSS was 6,318,428 / 6,332,872 KiB.
+Neither RSS value measures metadata cache alone.
+
+Q19 initially measured +7.0% and Q22 +4.5%, so they were repeated in reverse
+version order (R3 then R2b), nine executions each. All results validated.
+The eight warm samples gave Q19 medians 1.327352 / 1.369539 seconds (R3 -3.08%),
+and Q22 0.150160 / 0.149061 seconds (R3 +0.74%); ranges overlap in both cases.
+The initial slowdown did not reproduce. This local workload showed no stable
+regression; it is not a statistical equivalence claim or a remote-backend result.
+TPC-DS, real AWS, and multi-GPU qualification remain outside this local run.
+
+The agreed local acceptance scope is now passed: O8 and Sirius-path O9 are
+closed, the additional test-isolation finding is fixed, and the backend/identity
+and accounting boundaries above remain documented. Final evidence is in
+`runs/r3-followup/run_manifest.json`, `source_manifest.json`,
+`sf30_revision_comparison.csv`, and `sf30_focused_comparison.json`. Prior failed
+runs are preserved alongside successful reruns; overlapping suite counts are not
+summed into a fabricated total.
