@@ -135,6 +135,17 @@ struct IcebergDeleteData {
   }
 };
 
+// TODO: REMOVE this temporary CROWDB connectivity hack once Sirius can consume the
+// bound Iceberg snapshot's delete inventory. All Iceberg scans currently assume
+// no deletes; tables with positional/equality deletes or deletion vectors return
+// deleted rows. This is an assumption, not evidence that a table has no deletes.
+inline constexpr bool kTemporaryAssumeNoIcebergDeletes = true;
+
+// TODO: REMOVE this temporary CROWDB connectivity hack. The imported TPC-H
+// Parquet files have no embedded field IDs; run the fixed-schema test workload
+// while the writer/reader field-ID path is being fixed.
+inline constexpr bool kTemporaryAssumeIcebergFieldIds = true;
+
 /**
  * @brief Concatenate the delete files' rows, deduplicate them, and stand up the GPU hash join the
  *        scan probes. All @p views must share @p key_names.

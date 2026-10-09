@@ -65,6 +65,11 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// scheme; rejects @c s3://bucket with no key, @c file://, local paths).
   bool CanHandleFile(const std::string& fpath) override;
 
+  /// Probe an exact s3:// object with a routed HEAD. Missing objects return
+  /// false; authentication, network, and other transport failures propagate.
+  bool FileExists(const std::string& filename,
+                  duckdb::optional_ptr<duckdb::FileOpener> opener = nullptr) override;
+
   duckdb::unique_ptr<duckdb::FileHandle> OpenFile(
     const std::string& path,
     duckdb::FileOpenFlags flags,

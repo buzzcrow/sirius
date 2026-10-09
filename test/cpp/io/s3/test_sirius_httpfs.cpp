@@ -447,6 +447,18 @@ TEST_CASE("sirius_httpfs rejects write opens before opener resolution", "[s3][fi
   CHECK(read_message.find("no ClientContext") != std::string::npos);
 }
 
+TEST_CASE("sirius_httpfs FileExists probes routed S3 objects", "[.][s3][integration][filesystem]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  sirius_httpfs_fixture fixture(*env);
+  auto& fs = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+
+  CHECK(fs.FileExists(s3_uri(env->bucket, "parquet/nation.parquet")));
+  CHECK_FALSE(fs.FileExists(s3_uri(env->bucket, "parquet/does-not-exist.parquet")));
+}
+
 TEST_CASE("sirius_httpfs opens through FileOpener and reads positional ranges",
           "[.][s3][integration][filesystem]")
 {

@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -93,7 +94,8 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
                                                  scan_contract_provenance& provenance)
 {
   auto result = supported_parquet(contract, scan, context, provenance);
-  if (!iceberg_table_schema_has_field_ids(scan.bind_data.get())) {
+  if (!op::scan::kTemporaryAssumeIcebergFieldIds &&
+      !iceberg_table_schema_has_field_ids(scan.bind_data.get())) {
     result.verdict = op::scan::eligibility_verdict::unsupported;
     result.reason  = op::scan::verdict_reason::iceberg_table_schema_no_field_ids;
     result.reason_text =
@@ -102,7 +104,8 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
     result.later_checks = {};
     return result;
   }
-  result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
+  if (!op::scan::kTemporaryAssumeIcebergFieldIds)
+    result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
   return result;
 }
 

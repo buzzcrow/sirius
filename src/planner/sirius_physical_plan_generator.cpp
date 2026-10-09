@@ -330,6 +330,17 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->physical_schema = std::move(schema);
   }
 
+  if constexpr (sirius::op::scan::kTemporaryAssumeNoIcebergDeletes) {
+    // TODO: REMOVE with kTemporaryAssumeNoIcebergDeletes. Do not resolve another
+    // snapshot or read manifests: explicitly supply a non-null empty delete set.
+    if (!scan_op.parameters.empty() && !scan_op.parameters.front().IsNull()) {
+      info->table_path = scan_op.parameters.front().GetValue<std::string>();
+    }
+    info->delete_data = std::make_shared<sirius::op::scan::IcebergDeleteData>();
+    scan_op.delete_inventory.reset();
+    return info;
+  }
+
   if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
     throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
   }

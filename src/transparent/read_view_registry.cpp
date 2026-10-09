@@ -199,12 +199,10 @@ read_view_comparison compare_read_views_impl(
     result.candidate_hash = candidate.front().view->identity->fingerprint.hash;
   }
   if (origin == candidate_origin::replan) {
-    result.correspondence = candidate.empty() ? "none" : "single";
-    if (candidate.size() > 1) {
-      result.correspondence = "none";
-      result.reason         = "no_correspondence";
-      return result;
-    }
+    // Replans can contain multiple scans (TPC-H joins commonly do). Their table
+    // indexes are not stable across the fresh bind, but compare_multiset below
+    // already proves a one-to-one correspondence by the stable fingerprint.
+    result.correspondence = candidate.empty() ? "none" : "fingerprint_multiset";
   } else {
     result.correspondence = "table_index";
   }
@@ -215,14 +213,17 @@ read_view_comparison compare_read_views_impl(
       result.equal = true;
       return result;
     }
-    op::scan::bound_read_view const* selector_original = nullptr;
-    if (logical_original.size() == 1 &&
-        same_identity(logical_original.front().view, candidate.front().view)) {
-      selector_original = logical_original.front().view;
-    }
-    if (!selector_proven(*candidate.front().view, selector_original)) {
-      result.reason = "selector_unproven";
-      return result;
+    for (auto const& candidate_binding : candidate) {
+      op::scan::bound_read_view const* selector_original = nullptr;
+      auto const found =
+        std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
+          return same_identity(original.view, candidate_binding.view);
+        });
+      if (found != logical_original.end()) selector_original = found->view;
+      if (!selector_proven(*candidate_binding.view, selector_original)) {
+        result.reason = "selector_unproven";
+        return result;
+      }
     }
     result.equal = true;
     return result;

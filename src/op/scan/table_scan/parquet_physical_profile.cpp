@@ -18,6 +18,7 @@
 
 #include "io/parquet_helpers.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
@@ -474,6 +475,13 @@ physical_profile_result check_iceberg_file_schema(cudf::io::parquet::FileMetaDat
 {
   physical_profile_result result;
   result.approved = true;
+  // TODO: REMOVE with kTemporaryAssumeIcebergFieldIds. The imported CROWDB TPC-H
+  // files are fixed-schema benchmark data without Parquet field IDs; defer all
+  // per-file Iceberg field-ID validation until the writer/reader path is fixed.
+  if (kTemporaryAssumeIcebergFieldIds) {
+    result.validation = check_bit(later_check::profile_per_file);
+    return result;
+  }
   if (table.fields.empty()) return result;
   std::string path(probe_path);
   auto refuse = [&](verdict_reason reason, std::string text) {

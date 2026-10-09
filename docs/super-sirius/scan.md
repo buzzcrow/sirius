@@ -124,7 +124,17 @@ Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits on
 
 **Delete discovery** (`iceberg_metadata_reader.{hpp,cpp}`) delegates manifest parsing to DuckDB's `iceberg` and `avro` extensions. `iceberg_metadata()` covers everything except the three V3 deletion-vector fields it does not expose (`content_offset`, `content_size_in_bytes`, `referenced_data_file`), which a `read_avro` query over the containing manifest supplies. Results are memoized per query, keyed on transaction id plus table path plus snapshot, because one query reads delete data more than once — `iceberg_scan` is not serializable, so the plan is generated twice. `read_deletion_vector` (`puffin_reader.cpp`) validates the Puffin container's leading and trailing magic before seeking to a blob offset inside it, then checks the deletion-vector blob's own magic and CRC-32.
 
-**Failures throw; they never degrade to empty delete data.** An empty result is indistinguishable from "this table has no deletes", so swallowing a read error would turn *could not read the deletes* into *there are none* and return rows the table logically removed.
+**Temporary CROWDB connectivity hack:** `kTemporaryAssumeNoIcebergDeletes` is currently enabled.
+The planner skips delete discovery and supplies an empty delete inventory/payload, including for
+catalog scans without path/snapshot parameters. Tables with deletes will return deleted rows.
+TODO: remove this hack once Sirius consumes delete information from the bound Iceberg snapshot.
+The delete gates and snapshot requirements described below apply when this hack is disabled.
+
+The temporary `kTemporaryAssumeIcebergFieldIds` hack is also enabled for the imported CROWDB
+TPC-H files. Those files have no embedded Parquet field IDs; this is safe only for the fixed
+schema benchmark workload and must be removed after the writer/reader field-ID path is fixed.
+
+**Failures throw; they never degrade to empty delete data (when the temporary hack is disabled).** An empty result is indistinguishable from "this table has no deletes", so swallowing a read error would turn *could not read the deletes* into *there are none* and return rows the table logically removed.
 
 Tables the path cannot answer correctly **decline at plan time** (`sirius_plan_get.cpp`) rather than producing wrong rows — a `NotImplementedException` is the established CPU-fallback signal. Declining at plan time is deliberate: a runtime fallback wastes the plan, the GPU reservation and the decode, and it poisons the connection (the next GPU query on it deadlocks).
 

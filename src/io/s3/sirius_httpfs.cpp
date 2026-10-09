@@ -235,6 +235,37 @@ bool sirius_httpfs::CanHandleFile(const std::string& fpath)
   return slash != std::string_view::npos && slash != 0 && slash + 1 < rest.size();
 }
 
+bool sirius_httpfs::FileExists(const std::string& filename,
+                               duckdb::optional_ptr<duckdb::FileOpener> opener)
+{
+  if (!CanHandleFile(filename)) { return false; }
+
+  auto sirius_ctx = resolve_gated_sirius_context(opener, filename, "checking");
+  auto client     = duckdb::FileOpener::TryGetClientContext(opener);
+  if (!client) {
+    throw duckdb::IOException(
+      "[sirius_httpfs] client context unavailable while resolving S3 credentials");
+  }
+  auto s3_config = resolve_duckdb_s3_secret(
+    *client, filename, sirius_ctx->get_config().get_scan_manager_config().object_store);
+  sirius_ctx->get_scan_manager().install_s3_config(filename, std::move(s3_config));
+
+  try {
+    // create_datasource() opens the routed ioctx, whose object-store backend
+    // performs the authenticated HEAD needed to answer this exact-object
+    // probe. Do not use OpenFile here: DuckDB only needs existence and the
+    // returned datasource would otherwise be discarded immediately.
+    return static_cast<bool>(sirius_ctx->get_scan_manager().create_datasource(filename));
+  } catch (std::exception const& ex) {
+    // Iceberg uses FileExists for optional metadata such as version-hint.text.
+    // A missing object is a normal negative result; preserve all other errors
+    // so bad credentials and unavailable endpoints remain visible to callers.
+    std::string const message = ex.what();
+    if (message.find("HTTP 404") != std::string::npos) { return false; }
+    throw;
+  }
+}
+
 duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   const std::string& path,
   duckdb::FileOpenFlags flags,

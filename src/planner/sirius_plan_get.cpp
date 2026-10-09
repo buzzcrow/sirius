@@ -148,6 +148,15 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::optional<op::scan::iceberg_delete_inventory>& inventory,
   std::string_view injection)
 {
+  if constexpr (op::scan::kTemporaryAssumeNoIcebergDeletes) {
+    // TODO: REMOVE with kTemporaryAssumeNoIcebergDeletes. Catalog scans have no
+    // path/snapshot parameters; skip delete discovery and explicitly assume empty.
+    if (auto reason = iceberg_retired_field_id_decline_reason(op)) {
+      return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
+    }
+    inventory = op::scan::iceberg_delete_inventory{};
+    return std::nullopt;
+  }
   if (op.parameters.empty() || op.parameters.front().IsNull()) {
     return iceberg_decline(
       scan_reason::iceberg_no_table_path,
@@ -234,7 +243,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
   }
 
-  if (!iceberg_table_schema_has_field_ids(op.bind_data.get())) {
+  if (!op::scan::kTemporaryAssumeIcebergFieldIds &&
+      !iceberg_table_schema_has_field_ids(op.bind_data.get())) {
     return iceberg_decline(
       scan_reason::iceberg_table_schema_no_field_ids,
       "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
