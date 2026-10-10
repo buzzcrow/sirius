@@ -83,7 +83,7 @@ class metadata_cache {
 
  private:
   struct entry {
-    std::string key, path;
+    std::string key, candidate_key;
     uint64_t scope, generation;
     object_identity identity;
     std::shared_ptr<io_object_metadata> value;
@@ -101,6 +101,10 @@ class metadata_cache {
   entries lru_;
   std::unordered_map<std::string, iterator> index_;
   std::unordered_map<std::string, size_t> candidates_;
+  struct value_charge {
+    size_t references = 0, bytes = 0;
+  };
+  std::unordered_map<io_object_metadata const*, value_charge> charges_;
   counters stats_;
   bool stopping_ = false;
   std::thread worker_;

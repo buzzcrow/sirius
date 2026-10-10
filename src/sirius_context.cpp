@@ -42,6 +42,7 @@
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/materialized_collector.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -1983,6 +1984,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     // Replace the DuckDB CPU physical plan.
     prepared.physical_plan = std::move(new_physical_plan);
+    sirius::transparent::install_materialized_collector(context);
     record_transparent_rebind_success();
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");

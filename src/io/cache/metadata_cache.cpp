@@ -60,9 +60,14 @@ bool metadata_cache::expired(entry const& value, clock::time_point now) const
 void metadata_cache::retire(iterator it, entries& retired)
 {
   stats_.retained_bytes -= it->charge;
+  auto charged = charges_.find(it->value.get());
+  if (--charged->second.references == 0) {
+    stats_.retained_bytes -= charged->second.bytes;
+    charges_.erase(charged);
+  }
   --stats_.entries;
   index_.erase(it->key);
-  auto candidate = candidates_.find(key(it->scope, it->path, ""));
+  auto candidate = candidates_.find(it->candidate_key);
   if (candidate != candidates_.end() && --candidate->second == 0) candidates_.erase(candidate);
   retired.splice(retired.end(), lru_, it);
 }
@@ -106,9 +111,12 @@ void metadata_cache::put(uint64_t scope,
   if (!value) return;
   auto bytes  = value->account_retention();
   auto lookup = key(scope, path, profile);
+  // Open-local evidence cannot help the next open; keep its footer-probe fast path.
+  auto candidate_key =
+    identity.kind == identity_kind::opened_handle ? std::string{} : key(scope, path, "");
   // Conservative charge includes duplicate index key, list/map nodes and buckets.
   auto overhead =
-    sizeof(entry) + 192 + 4 * lookup.capacity() + path.capacity() + identity.version.capacity();
+    sizeof(entry) + 256 + 4 * lookup.capacity() + path.capacity() + identity.version.capacity();
   entries retired;
   std::lock_guard lock(mutex_);
   auto found = index_.find(lookup);
@@ -118,7 +126,12 @@ void metadata_cache::put(uint64_t scope,
       ++stats_.bypasses;
       return;
     }
-    if (it->identity == identity) return;
+    if (it->identity == identity) {
+      // A duplicate publication still advances the local ordering fence.
+      // Otherwise an older, different-version fill could replace this record.
+      it->generation = generation;
+      return;
+    }
     ++stats_.replacements;
     retire(it, retired);
   }
@@ -126,11 +139,13 @@ void metadata_cache::put(uint64_t scope,
     ++stats_.bypasses;
     return;
   }
-  auto charge = bytes + overhead;
+  // A shared record can be referenced by multiple compatible cache entries.
+  // Recompute after each eviction: retiring its last alias changes admission.
+  auto charge = [&] { return overhead + (charges_.contains(value.get()) ? 0 : bytes); };
   auto now    = config_.now();
   size_t work = 0;
   while (!lru_.empty() && work < config_.batch &&
-         (expired(lru_.back(), now) || stats_.retained_bytes > config_.capacity - charge)) {
+         (expired(lru_.back(), now) || stats_.retained_bytes > config_.capacity - charge())) {
     if (expired(lru_.back(), now))
       ++stats_.idle_evictions;
     else
@@ -138,32 +153,36 @@ void metadata_cache::put(uint64_t scope,
     retire(std::prev(lru_.end()), retired);
     ++work;
   }
-  if (stats_.retained_bytes > config_.capacity - charge) {
+  if (stats_.retained_bytes > config_.capacity - charge()) {
     ++stats_.bypasses;
     return;
   }
   lru_.push_front({std::move(lookup),
-                   path,
+                   std::move(candidate_key),
                    scope,
                    generation,
                    std::move(identity),
                    std::move(value),
-                   charge,
+                   overhead,
                    now});
   try {
-    ++candidates_[key(scope, path, "")];
+    charges_.try_emplace(lru_.front().value.get(), value_charge{0, bytes});
+    if (!lru_.front().candidate_key.empty()) ++candidates_[lru_.front().candidate_key];
     try {
       index_.emplace(lru_.front().key, lru_.begin());
     } catch (...) {
-      auto candidate = candidates_.find(key(scope, path, ""));
-      if (--candidate->second == 0) candidates_.erase(candidate);
+      auto candidate = candidates_.find(lru_.front().candidate_key);
+      if (candidate != candidates_.end() && --candidate->second == 0) candidates_.erase(candidate);
       throw;
     }
   } catch (...) {
+    auto charged = charges_.find(lru_.front().value.get());
+    if (charged != charges_.end() && charged->second.references == 0) charges_.erase(charged);
     retired.splice(retired.end(), lru_, lru_.begin());
     throw;
   }
-  stats_.retained_bytes += charge;
+  auto& charged = charges_.at(lru_.front().value.get());
+  stats_.retained_bytes += overhead + (charged.references++ == 0 ? charged.bytes : 0);
   ++stats_.entries;
 }
 void metadata_cache::erase_scope(uint64_t scope)

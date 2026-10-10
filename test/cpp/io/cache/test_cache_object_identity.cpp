@@ -261,7 +261,7 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   REQUIRE_FALSE(old_tag.empty());
   CHECK(old_key == rest_io_object::generation_key(objects.uri, old_tag));
   auto& store = first->io_ctx()->metadata_store();
-  CHECK(store.has_path(objects.uri));
+  CHECK(store.has_candidate(objects.uri));
   objects.publish(objects.second);
   auto second_shape = manager.describe_parquet(objects.uri);
   REQUIRE(second_shape.names.size() == 1);
@@ -269,8 +269,8 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   auto second = manager.create_datasource(objects.uri);
   REQUIRE(second->get_io_object().validation_tag() != old_tag);
   CHECK(second->get_io_object().raw_file_cache_id() != old_key);
-  CHECK(store.has_path(objects.uri));
-  CHECK(store.get_metadata(old_key) == nullptr);
+  CHECK(store.has_candidate(objects.uri));
+  CHECK(store.get_metadata(first->get_io_object()) == nullptr);
   CHECK(second->metadata() != nullptr);
   auto parsed = std::dynamic_pointer_cast<sirius::op::scan::parquet_metadata>(old_metadata);
   REQUIRE(parsed != nullptr);

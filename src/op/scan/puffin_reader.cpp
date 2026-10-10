@@ -441,7 +441,7 @@ std::streamoff validate_footer_descriptor(
   Ref const& ref,
   char const (&puffin_magic)[4],
   sirius::scan_manager::charging_allocator* allocator = nullptr,
-  puffin_read_statistics* stats = nullptr)
+  puffin_read_statistics* stats                       = nullptr)
 {
   // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
   static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
@@ -523,29 +523,8 @@ struct decoded_positions {
 template <typename Ref>
 decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
                                              Ref const& ref,
-                                             sirius::scan_manager::charging_allocator* allocator,
-                                            physical_check_counters const* counters)
+                                             sirius::scan_manager::charging_allocator* allocator)
 {
-  struct read_report {
-    physical_check_counters const* counters;
-    std::string const& file;
-    bool charged;
-    puffin_read_statistics statistics;
-    ~read_report()
-    {
-      if (!counters) return;
-      try {
-        counters->puffin_reads_for_testing(file, charged, statistics);
-      } catch (...) {
-        // Test diagnostics must not replace a reader error during stack unwinding.
-      }
-    }
-  } report{
-    counters && counters->track_units && counters->puffin_reads_for_testing ? counters : nullptr,
-    ref.puffin_path,
-    allocator != nullptr,
-    {}};
-  auto* stats                      = report.counters ? &report.statistics : nullptr;
   auto const& puffin_path = ref.puffin_path;
   auto const record_count = ref.record_count;
   // deletion-vector-v1: [4B BE combined_length][4B magic][roaring_vector][4B BE CRC-32]
@@ -748,7 +727,8 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
     throw sirius::scan_manager::preparation_resource_error(
       "Puffin container exceeds the lowering-time envelope", true);
-  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator, stats);
+  auto const footer_start =
+    validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator, stats);
 
   // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
   // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a

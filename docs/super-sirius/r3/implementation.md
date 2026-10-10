@@ -36,16 +36,16 @@ and incorrectly label the library unused for this branch. The actual installed
 26.08 public headers are the API authority. cuDF I/O, cuCascade memory and the
 Super Sirius architecture/scan/memory docs were also read.
 
-### Verification environment and unresolved measurements
+### Verification environment and measurement scope
 
 Local GPU: RTX 2080, 8192 MiB. Existing test binary is dated 2026-09-24 and is not
-accepted as evidence for the R2b commit. Pixi is synchronizing the locked CUDA 13
-environment before a current build can be attempted. GPU/runtime compatibility
-must be checked, not inferred from binary presence.
+accepted as evidence for the R2b commit. At S0, Pixi was synchronizing the locked
+CUDA 13 environment. Subsequent builds use the synchronized environment; runtime
+qualification is recorded under S5.
 
-TPC-H/TPC-DS SF100/SF1000 datasets are unavailable locally. End-to-end comparison
-remains outstanding on a provisioned machine. Host unit tests and synthetic
-cache workloads can verify correctness and overhead, but cannot close this gate.
+The user removed the large-scale TPC-H/TPC-DS end-to-end performance matrix
+from R3 scope. Local cache, real-file and request-count measurements remain;
+the removed matrix is neither a pending task nor an acceptance gate.
 
 ### Decisions needed if capability gaps affect integration
 
@@ -68,8 +68,9 @@ No third-party source or network request is changed.
 Host-only Catch2 verification: 2 cases, 19 assertions passed using `pixi run
 --as-is` and the installed compiler. Coverage includes version/kind/size changes,
 local same-size mtime changes, identity after unlink while the fd is retained,
-and invalid-fd reporting. Full backend compilation is pending environment setup:
-the current include tree is missing cuda/std/iterator during synchronization.
+and invalid-fd reporting. At S1, full backend compilation was pending environment
+setup: cuda/std/iterator was missing during dependency synchronization. The
+subsequent compilation evidence is recorded below.
 
 ## S2: cache integration and retention
 
@@ -119,3 +120,282 @@ The existing Puffin corpus passed: 18 cases / 159 assertions, including malforme
 inputs and charged-memory failure behavior. This executable was compiled from
 current production parser, ledger, preparation and failure-classification sources
 with the generated build flags; it does not rely on the stale baseline executable.
+
+## S5: integration and qualification
+
+S5 closes implementation gaps found during integration:
+
+- Default bind, pin and scan options use one canonical, complete-footer parse.
+  Query projections are applied by the consuming reader, avoiding separate cache
+  records/parses solely for different selected columns. Non-default schema
+  options keep distinct profiles; custom nested schemas still bypass retention.
+- Entries with only open-local identity do not suppress the next open's suffix
+  probe. They cannot produce a cross-open hit, so using them as a candidate would
+  add an unnecessary HEAD before a fresh footer fetch.
+- Shared records are charged once even when retained under multiple cache keys.
+  Cache-node overhead remains per entry. Removal uses a stored candidate key and
+  destroys payloads after unlocking.
+- Duplicate same-identity publications advance the local generation fence so a
+  later-finishing, older different-identity publication cannot replace them.
+- Consumption requires nonempty identity and an owner matching the footer's
+  shared ownership. The test-only private codec-injection copy receives its own
+  retained record, preserving that invariant without mutating cached metadata.
+
+### Host verification
+
+Current-source executables, built through `pixi run --as-is`:
+
+- Identity capture: 2 cases / 22 assertions, including reopening an unlinked fd.
+- Actual Parquet record ownership plus metadata-store reopening/scope checks:
+  2 cases / 15 assertions.
+- Cache identity, LRU, shared capacity, expiry, background maintenance, concurrent
+  publication, shared charge, reentrant destruction and 10,000-operation stress:
+  10 cases / 10,049 assertions passed under ASan/UBSan, including the final
+  duplicate-publication ordering regression.
+- Existing Puffin corpus: 18 cases / 159 assertions on both the fixed R2b parser
+  source and R3, using the same compiler/dependencies/corpus.
+- Existing preparation completion, unit and ledger suites: 40 cases / 759 assertions.
+- Existing preparation readiness/overlap/cancellation suite: 25 cases / 252 assertions.
+- Production REST reactor with the checked-in local HTTP server: 1 parameterized
+  case / 24 assertions. Both HEAD and footer-suffix identities authorize the
+  unchanged object; a different server version produces HTTP 412 with exactly one
+  data GET and no retry. The host harness uses verbatim helpers/test code from
+  test_rest_ioctx_integration.cpp; it is not a full S3 service qualification.
+
+The full build passed with `pixi run env CMAKE_BUILD_PARALLEL_LEVEL=4 make`,
+followed by a successful final-source incremental build with parallel level 8.
+Final-source integration test results are recorded below. These supersede earlier
+per-step environment status, but do not substitute for an R2b end-to-end baseline.
+
+### GPU integration verification
+
+The built `sirius_unittest` executable passed:
+
+- Identity/cache/retention/preparation/certificate selection: 142 cases / 16,384
+  assertions, including stale raw fills and strict split ownership checks.
+- Parquet profile and cache selection: 82 cases / 2,112,851 assertions.
+
+The first wider scan/S3/Iceberg run explicitly selected hidden cases as well:
+unconfigured SF10 and real-AWS cases failed their prerequisites. It also exposed
+an old request-count expectation that allowed footer reuse without an ETag. The
+updated test checks both capabilities: with ETag, the second describe uses HEAD
+and reuses the footer; without ETag, it fetches a fresh suffix with no extra HEAD.
+The replacement regular suite passed: **777 cases / 2,636,731 assertions**, using
+the managed local SeaweedFS HTTP/TLS service in strict mode and seed
+`2090273576`. Selection was scan/S3/Iceberg/io_uring, excluding hidden and
+multi-GPU cases, with prepared-statement coverage separated for the dependency
+issue below. It does not count unconfigured tests as passed. The final local
+generation-fence change was subsequently checked with the cache sanitizer suite
+and a final incremental build/test check; it does not change query execution.
+
+The wider run completed with 823/835 cases passing. Of 12 failed cases, ten were
+unconfigured opt-in SF10/real-AWS tests, one was the request-count expectation
+above, and one was the abandoned-pending context issue below. The updated
+request-count case passed both sections (with/without ETag).
+
+The final incremental build passed. The final identity/cache/retention/prepared
+selection ran 19 cases / 10,308 assertions: 18 cases passed and the same abandoned
+PendingQuery case failed its two zero-retention assertions. The final cache-only
+ASan/UBSan run passed 10 cases / 10,049 assertions. This is an explicitly recorded
+acceptance failure, not an all-green qualification.
+
+### Synthetic cache measurement
+
+Intel i9-7960X (16 cores / 32 threads), 62 GiB host memory, RTX 2080; installed
+GCC 15.3, `-O2`, 10,000 synthetic files with actual 4 KiB
+record buffers; process cache policy defaults except background maintenance off.
+The workload is checked in as the hidden `[metadata_cache_bench]` case. During a
+concurrent four-worker full build, first insertion took 49.4 ms and retained
+charge was 50,698,900 bytes. Each warm sample performs 100,000 hits in total:
+
+| Workers | Three samples (ms)      |
+| ------- | ----------------------- |
+| 1       | 63.8, 63.8, 63.4         |
+| 4       | 123.3, 105.6, 114.8      |
+| 8       | 115.2, 116.9, 116.6      |
+
+This exposes serialization in the shared LRU lock. These are manager-throughput
+measurements under build contention, not per-query latency or a regression ratio.
+The post-build repeat is recorded below. No percentage acceptance threshold has
+been invented; these measurements support local overhead analysis only.
+
+After the build finished, the same checked-in workload through the full release
+test executable measured insertion at 35.5 ms with the same retained charge:
+
+| Workers | Three samples (ms) |
+| ------- | ------------------ |
+| 1       | 55.9, 28.3, 30.7   |
+| 4       | 92.7, 80.1, 92.3   |
+| 8       | 90.1, 85.4, 86.5   |
+
+The concurrent-throughput concern remains; these samples do not establish an
+end-to-end regression against R2b.
+
+### Real local footer measurement
+
+The hidden `[parquet_footer_cache_bench]` case copies the 2,294-byte, 25-row nation
+fixture to 10,000 distinct local files and uses production kvikio opens and
+`resolve_parquet_metadata`. File-copy setup is excluded; both passes have warm OS
+page cache, and raw prefetch is not initialized. All files have the same small
+schema, so this does not estimate large-footer/TPC memory usage.
+
+| Metadata state | Hits / files   | Time (ms) | Retained charge (bytes) |
+| -------------- | -------------- | --------- | ----------------------- |
+| Cold           | 0 / 10,000     | 2,003.4   | 59,977,777              |
+| Warm           | 10,000 / 10,000 | 380.3     | 59,977,777              |
+
+Destroying the ioctx returned retained charge to its initial value. This test,
+the synthetic benchmark and the two-section REST describe case passed together:
+3 cases / 20,049 assertions. Measurements are one local run, not an SF-scale
+performance acceptance or RSS measurement.
+
+### Abandoned PendingQuery dependency reproduction
+
+The existing `GPU prepared statements own and renew deferred reservations` test
+passed in the initial focused run but failed in the wider run and an isolated
+repeat with seed `2090273576`. Its execute/rebind and next-statement-cleanup
+sections pass; the section dropping the connection before pending/prepared
+handles can retain one reservation (117–118 descriptor bytes in these runs).
+The original test and zero-retention assertions have not been weakened.
+
+`pending_context_repro.cpp` reproduces retained ClientContext ownership using
+only DuckDB APIs: `SIRIUS_DISABLE=1`, `SELECT 42`, materialized `PendingQuery`, then
+drop all three user handles. All five trials still retained the context after
+100 ms; explicit `ClientContext::Destroy()` released it. It was compiled with
+the current generated flags and linked with the same DuckDB static libraries.
+No GPU scan/footer parser is executed in this reproduction. The pinned DuckDB
+materialized collector's global state owns a shared ClientContext, while an
+abandoned context owns its pending executor; initializer scheduling affects when
+this retention appears. The Sirius compatibility fix described below removes the
+cycle from its materialized GPU result path. The pure DuckDB reproduction still
+documents the dependency behavior; no third-party source changed.
+
+### Backend boundaries and acceptance follow-ups
+
+1. Remote kvikio lacks a public ETag/conditional-read interface on the installed
+   pin; REST known-size opens also carry no validator. Their open-local fallback
+   preserves cache isolation but reduces warm reuse and cannot prove that multiple
+   requests observe a remotely mutable object. Ordinary REST footer-probe/HEAD
+   opens do capture ETag; these paths must be measured separately.
+2. O8 is resolved by the raw-cache retirement follow-up below. Metadata's 1 GiB
+   allowance still does not cover raw indexes; one current entry per locator is
+   retained, while active users can temporarily own retired versions.
+3. Local size+mtime is best effort: concurrent in-place changes and preserved
+   mtime are not immutable-read guarantees. Sirius io_uring reopens its buffered
+   fd via /proc/self/fd for O_DIRECT, avoiding a second pathname-resolution race.
+   Third-party backend-internal handle creation is outside Sirius control.
+4. Live metadata charge estimates owned records. It is not a query allocation
+   permit, allocator-exact heap measurement or cap on in-flight parsing/active
+   splits. The record ownership and cache-budget bounds must not be presented as
+   an RSS limit.
+5. O9 is resolved for Sirius materialized GPU plans by the collector follow-up
+   below. Unmodified CPU-only DuckDB collectors and embedder-supplied collectors
+   retain their own lifecycle behavior; this is not a general DuckDB patch.
+
+
+### O8 follow-up: retire superseded raw-cache entries
+
+The user authorized completing the remaining acceptance work. The raw cache now
+keeps one current identity per raw locator in each ioctx. Publishing a different
+identity detaches the previous entry. Requests, exported chunk-vector aliases,
+physical fill callbacks, and cache-hit CUDA retirements retain the old arena until
+their final use. Its last owner returns resident buffers to their originating NUMA
+pool and releases the index, arena, and io_object. Destruction occurs outside the
+map lock. This preserves old-reader correctness without retaining every historical
+version until cache teardown.
+
+The eviction worker drops disposed requests for retired entries independently of
+buffer pressure. It polls every 100 ms only while a superseded request remains
+active; unchanged warm caches keep event-driven maintenance. Current-version raw
+buffer eviction policy is unchanged. Reopening a handle without a validator also
+replaces its old open-local cache entry. This bounds retained *versions per
+locator*, not the total number of distinct locators or memory held by live readers.
+
+Tests cover 24 successive validated and unvalidated opens with no explicit eviction,
+late physical I/O after abandoning its handle, and an intentionally blocked CUDA
+copy on a cache hit without a prefetch handle. Weak io_object ownership and buffer
+counts verify reclamation; existing late-v1/v2 tests verify byte isolation.
+The identity/retirement sanitizer run passed 9 cases / 311 assertions. The raw-cache
+implementation and arbitration test translation units were built with ASan/UBSan
+and linked against the remaining Release objects; this is not whole-program
+sanitizer coverage. `ASAN_OPTIONS=detect_leaks=0:protect_shadow_gap=0`,
+`UBSAN_OPTIONS=halt_on_error=1`, and `CUDA_MODULE_LOADING=LAZY` were used. Default
+ASan startup reported CUDA allocation errors before tests, including a serial
+attempt with ample free VRAM; those attempts are retained as environment failures,
+not test passes. Logs and the instrumented executable are under `runs/r3-followup/`.
+
+
+### O9 follow-up: materialize Sirius results without a context cycle
+
+Sirius now installs a stateless factory through DuckDB's public
+`ClientConfig::get_result_collector` hook when publishing a GPU physical plan,
+unless the caller has already supplied a factory. Only a direct
+`PhysicalSiriusExecution` root uses the new collector; CPU roots delegate to
+DuckDB's normal factory, and streaming selection remains DuckDB's responsibility.
+
+The Sirius source has one execution thread, so its collector appends into one
+ordered collection and snapshots `ClientProperties` by value. It uses the base
+`CreateCollection` API for both in-memory and buffer-managed results. No strong
+ClientContext reference is retained in the sink, eliminating the
+context -> executor -> collector -> context cycle without forced context teardown,
+timers, changes to third-party code, or weakened release assertions.
+
+The original prepared-statement zero-reservation assertions pass, including a
+new section that lets the pending executor initialize before dropping handles
+and then checks weak ClientContext expiry. Empty and 5,000-row ordered outputs,
+both result-memory modes, result lifetime after connection release, and respecting
+an embedder collector are covered. The combined focused run passed 12 cases /
+10,557 assertions with the original failure seed `2090273576`.
+
+
+The complete R3 scan/S3/Iceberg/io_uring/cache regression, with strict managed
+SeaweedFS HTTP/TLS and the physical-profile fixtures, passed 923 cases /
+4,758,551 assertions at the same seed. The broader transparent-execution run
+exposed a separate read-view fixture leak of the database-global optimizer mask;
+that test-isolation issue is handled in its own follow-up, not by weakening the
+regex test's GPU-route expectations.
+
+
+### Additional acceptance finding: optimizer-mask test isolation
+
+The expanded transparent regression initially passed 139/140 cases. The regex
+GPU-route assertion failed because an earlier read-view fixture executed
+`RESET disabled_optimizers`, clearing the database-global Sirius optimizer mask
+for later fixtures sharing that database. The log showed an unsupported
+`__internal_compress_integral_utinyint` projection before collector construction;
+the regex case passed alone (71 assertions). No regex/output assertion was relaxed.
+
+`ReadViewFixture` now saves the original optimizer set and restores it on scope
+exit, including assertion unwinding. Its tests can still deliberately reset or
+override the mask within their own scope. Repeating the original transparent
+filter and seed passed 140 cases / 15,510 assertions. The test-only edit was
+compiled and linked using the generated build commands; the already-validated
+production extension was unchanged. Both the failed and fixed runs are retained
+under `runs/r3-followup/`.
+
+
+### Final SF30 comparison after O8/O9
+
+TPC-H SF30 was rerun against exact R2b `ca294edad` and production R3 `b1766ff3`,
+using the same 9-file data, CPU oracle, Release toolchain, integration config,
+16 DuckDB threads, hot/grouped profile, no pinning and disabled CPU fallback.
+Each version executed 22 queries five times; both validated 22/22 with no errors.
+The sum of per-query medians over iterations 1–4 was 15.868405 seconds for R2b
+and 15.909482 for R3 (+0.26%). Max process RSS was 6,318,428 / 6,332,872 KiB.
+Neither RSS value measures metadata cache alone.
+
+Q19 initially measured +7.0% and Q22 +4.5%, so they were repeated in reverse
+version order (R3 then R2b), nine executions each. All results validated.
+The eight warm samples gave Q19 medians 1.327352 / 1.369539 seconds (R3 -3.08%),
+and Q22 0.150160 / 0.149061 seconds (R3 +0.74%); ranges overlap in both cases.
+The initial slowdown did not reproduce. This local workload showed no stable
+regression; it is not a statistical equivalence claim or a remote-backend result.
+TPC-DS, real AWS, and multi-GPU qualification remain outside this local run.
+
+The agreed local acceptance scope is now passed: O8 and Sirius-path O9 are
+closed, the additional test-isolation finding is fixed, and the backend/identity
+and accounting boundaries above remain documented. Final evidence is in
+`runs/r3-followup/run_manifest.json`, `source_manifest.json`,
+`sf30_revision_comparison.csv`, and `sf30_focused_comparison.json`. Prior failed
+runs are preserved alongside successful reruns; overlapping suite counts are not
+summed into a fabricated total.
