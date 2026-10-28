@@ -144,7 +144,7 @@ The evaluator supports three strategies, selected via `policy.strategy` in the `
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
-| `MATERIALIZE` | Materializes intermediate results as `cudf::column`s. Floating comparisons use small interpreted ASTs for NaN semantics; this strategy never selects AST JIT. | `cudf::unary_operation`, `cudf::binary_operation`, `cudf::compute_column` |
+| `MATERIALIZE` | Every expression node becomes a single kernel. Intermediate results are materialized as `cudf::column`s. | `cudf::unary_operation`, `cudf::binary_operation`, etc. (one per node) |
 | `AST_INTERPRET` (default) | Builds a `cudf::ast::tree` and interprets it with a single monolithic kernel. | `cudf::compute_column` |
 | `AST_JIT` | Builds a `cudf::ast::tree` and JIT-compiles it into a fused kernel. | `cudf::compute_column_jit` |
 
@@ -216,7 +216,7 @@ constant after constant folding has run, so `month(coalesce(DATE '2020-02-01', d
 GPU as `month(DATE '2020-02-01')`.
 Parameters that must be constants, such as a `LIKE` pattern or `substring` bounds, stay scalars.
 
-`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings for IN chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to `NOT_EQUAL` comparisons joined by `NULL_LOGICAL_AND`, so parquet pruning never negates Bloom membership answers (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values. Under `MATERIALIZE`, all-constant lists (including FLOAT/DOUBLE) use `cudf::contains` over the non-NULL entries; this lookup treats NaNs and signed zeros as equal. When the list also has a NULL, the evaluator combines the result with a NULL scalar using `NULL_LOGICAL_OR`. Floating lists with nonconstant entries retain the NaN-aware comparison chain.
+`in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted. `x IN (a, b)` follows SQL semantics: TRUE on any match, otherwise NULL if `x` or any list entry is NULL, otherwise FALSE; NOT IN negates that. The AST lowerings for IN chain the per-entry `EQUAL`s with `NULL_LOGICAL_OR`. The standalone translator lowers NOT IN to `NOT_EQUAL` comparisons joined by `NULL_LOGICAL_AND`, so parquet pruning never negates Bloom membership answers (see [Row Group Pruning](scan.md#row-group-pruning)). The row evaluator can negate its IN result because it operates on actual row values. The all-constant materialize path runs `cudf::contains` over the non-NULL entries and, when the list also has a NULL, ORs the result with a NULL scalar.
 
 ### String concatenation
 

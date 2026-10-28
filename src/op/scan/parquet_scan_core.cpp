@@ -1953,7 +1953,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   out->file_path       = file_path;
   out->file_index      = file_index;
   out->datasource      = std::move(sirius_ds);
-  out->reader_options = std::move(file_options);
+  out->reader_options  = std::move(file_options);
   if (mapping) out->reader_options = std::move(mapped_reader_options);
   out->field_mapping           = mapping;
   out->carrier_unavailable     = carrier_unavailable;
@@ -2567,11 +2567,6 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->parquet_phase(slice.file_path, false);
-  }
-
-  if (auto const& counters = _info->profiles->counters;
-      counters && counters->track_units && counters->parquet_filter_for_testing) {
-    counters->parquet_filter_for_testing(opts.get_filter().has_value(), table->num_rows());
   }
 
   // Hive-partition scans assemble inline here: partition_values are per-split
