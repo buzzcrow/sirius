@@ -78,6 +78,17 @@ Virtual scans already budget their output columns, reader indices and selection/
 
 Internal-only positions qualify after normal batching against the finite batch cap. Their alternative peak is used by execution reservation, while file/split preparation charges and timed batch fill retain the same additive grouping estimate. Plain Parquet and Iceberg reader-mode virtual scans no longer reserve per-row-group table concatenation.
 
+Canonical lineage is opt-in. Identity and interval selections retain host interval
+metadata; device selections use one INT64 ordinal column. Conversion consumes the
+cuDF UINT64 row buffer in place, then releases source indices.
+`lineage_conversion_workspace_bytes()` budgets conversion validation scratch;
+`shared_materialization_workspace_bytes()` provides a conservative additional
+selection/visibility peak for independent decoder adapters. These callers must
+also budget their decoder, mapping and requested virtual-column outputs. Neither
+estimate changes the additive preparation ledger or timed batch-fill measure,
+and default Parquet/Iceberg scans do not reserve canonical-lineage scratch.
+
+
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
 ## Memory Reservations
