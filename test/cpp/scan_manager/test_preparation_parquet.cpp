@@ -133,10 +133,11 @@ struct parquet_preparation : fixture {
       auto index = next++;
       return preparation_coordinator::job{
         [index] {
-          auto file                     = std::make_unique<scan::parquet_file_scan_info>();
-          file->file_index              = index;
-          file->file_path               = std::to_string(index) + ".parquet";
-          file->disable_filter_pushdown = true;
+          auto file                        = std::make_unique<scan::parquet_file_scan_info>();
+          file->file_index                 = index;
+          file->file_path                  = std::to_string(index) + ".parquet";
+          file->disable_filter_pushdown    = true;
+          file->static_reader_filter_ready = true;
           file->set_contract_payload(
             1, {{.contract_id = 1, .split_id = 0, .input_identity = file->file_path}}, {{}});
           for (int group : {0, 1}) {

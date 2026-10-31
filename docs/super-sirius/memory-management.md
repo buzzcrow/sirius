@@ -78,6 +78,13 @@ Virtual scans already budget their output columns, reader indices and selection/
 
 Internal-only positions qualify after normal batching against the finite batch cap. Their alternative peak is used by execution reservation, while file/split preparation charges and timed batch fill retain the same additive grouping estimate. Plain Parquet and Iceberg reader-mode virtual scans no longer reserve per-row-group table concatenation.
 
+Position candidates capture their dynamic-filter snapshot when the split is emitted. Admission
+checks the same snapshot and static reader translation as decode, on the target GPU. Without a
+usable reader predicate, the execution estimate excludes the internal position workspace and
+decode retains interval deletion; filters published later cannot enable positions for that split.
+User-requested virtual columns retain their own workspace. Pipeline memory history and retry
+floors still apply independently; this removes the position estimate, not other measured peaks.
+
 Canonical lineage is opt-in. Identity and interval selections retain host interval
 metadata; device selections use one INT64 ordinal column. Conversion consumes the
 cuDF UINT64 row buffer in place, then releases source indices.

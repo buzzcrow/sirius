@@ -5,6 +5,7 @@
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
@@ -35,6 +36,30 @@
 
 using namespace sirius::op::scan;
 namespace {
+class residual_only_dynamic_filter final : public sirius::op::sirius_dynamic_filter {
+ public:
+  sirius::op::sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius::op::sirius_dynamic_filter_kind::BLOOM;
+  }
+};
+
+class unavailable_reader_filter final : public sirius::op::sirius_dynamic_filter,
+                                        public sirius::op::sirius_ast_lowerable {
+ public:
+  sirius::op::sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius::op::sirius_dynamic_filter_kind::ZONE_MAP;
+  }
+  bool is_available_on_device(int) const noexcept override { return false; }
+  cudf::ast::expression const& to_ast(cudf::ast::tree&,
+                                      cudf::ast::expression const&,
+                                      int) const override
+  {
+    throw std::logic_error("unavailable reader filter must not be lowered");
+  }
+};
+
 template <typename T>
 std::unique_ptr<cudf::column> device_column(std::vector<T> const& values,
                                             cudf::type_id type,
@@ -452,22 +477,29 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Position requests follow actual consumers",
                  "[scan][row_positions][execution_record][integration]")
 {
-  auto const mode    = std::string(GENERATE("parquet",
+  auto const mode           = std::string(GENERATE("parquet",
                                          "iceberg_empty",
                                          "iceberg_unfiltered",
                                          "iceberg_dynamic",
                                          "iceberg_dynamic_pending",
                                          "iceberg_dynamic_late",
+                                         "iceberg_dynamic_before_emission",
+                                         "iceberg_dynamic_unlowerable",
+                                         "iceberg_dynamic_unavailable",
+                                         "iceberg_dynamic_wrong_column",
+                                         "iceberg_dynamic_static_pending",
                                          "iceberg_cast",
                                          "iceberg_partial",
                                          "iceberg_all",
                                          "iceberg_unselected"));
-  bool const dynamic = mode == "iceberg_dynamic" || mode == "iceberg_dynamic_pending" ||
-                       mode == "iceberg_dynamic_late";
-  auto const virtual_kind = GENERATE(0, 1, 2);  // none, row number, filename
+  bool const dynamic        = mode.starts_with("iceberg_dynamic");
+  bool const static_pending = mode == "iceberg_dynamic_static_pending";
+  auto const virtual_kind   = GENERATE(0, 1, 2);  // none, row number, filename
   bool const reader_positions =
     dynamic || mode == "iceberg_partial" || mode == "iceberg_all" || mode == "iceberg_unselected";
-  bool const actual_positions = reader_positions && mode != "iceberg_dynamic_pending";
+  bool const actual_positions =
+    reader_positions && (!dynamic || mode == "iceberg_dynamic" ||
+                         mode == "iceberg_dynamic_before_emission" || static_pending);
   CAPTURE(mode, virtual_kind);
   sirius::test::scratch_dir directory("position_demand");
   auto const path = directory.file("input.parquet");
@@ -528,11 +560,22 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   std::optional<sirius::op::sirius_dynamic_filter_set::producer> dynamic_producer;
   auto publish_dynamic = [&] {
     using namespace sirius::op;
+    if (mode == "iceberg_dynamic_unlowerable" || mode == "iceberg_dynamic_unavailable") {
+      std::shared_ptr<sirius_dynamic_filter const> filter =
+        mode == "iceberg_dynamic_unlowerable" ? std::shared_ptr<sirius_dynamic_filter const>(
+                                                  std::make_shared<residual_only_dynamic_filter>())
+                                              : std::shared_ptr<sirius_dynamic_filter const>(
+                                                  std::make_shared<unavailable_reader_filter>());
+      REQUIRE(dynamic_producer->push_filter(0, std::move(filter)));
+      dynamic_producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
+      return;
+    }
     std::vector<zone_map_entry> zones;
     zones.push_back({std::make_unique<cudf::numeric_scalar<int32_t>>(100, true),
                      std::make_unique<cudf::numeric_scalar<int32_t>>(399, true)});
     REQUIRE(dynamic_producer->push_filter(
-      0, std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones))));
+      mode == "iceberg_dynamic_wrong_column" ? 33 : 0,
+      std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones))));
     dynamic_producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
   };
   if (dynamic) {
@@ -541,8 +584,15 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     info->table_filters->PushFilter(duckdb::ProjectionIndex(0),
                                     sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
     info->sirius_dynamic_filters = std::make_shared<sirius_dynamic_filter_set>();
-    dynamic_producer.emplace(info->sirius_dynamic_filters->register_producer({0}));
-    if (mode == "iceberg_dynamic") publish_dynamic();
+    dynamic_producer.emplace(info->sirius_dynamic_filters->register_producer({0, 33}));
+    if (mode == "iceberg_dynamic" || mode == "iceberg_dynamic_unlowerable" ||
+        mode == "iceberg_dynamic_unavailable" || mode == "iceberg_dynamic_wrong_column")
+      publish_dynamic();
+    if (static_pending)
+      info->table_filters->PushFilter(
+        duckdb::ProjectionIndex(0),
+        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                      duckdb::Value::INTEGER(100)));
   } else if (mode != "iceberg_unfiltered") {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     info->table_filters->PushFilter(
@@ -579,26 +629,45 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
   auto prepare = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto prepared = prepare({});
+  auto prepared                = prepare({});
+  auto const preparation_bytes = prepared->preparation_bytes();
+  std::size_t unfiltered_bytes = 0;
+  for (auto const& group : dynamic_cast<parquet_file_scan_info const&>(*prepared).row_groups)
+    unfiltered_bytes += group.unfiltered_working_bytes.value_or(group.decode_working_bytes);
   CHECK(dynamic_cast<parquet_file_scan_info&>(*prepared).requires_row_positions ==
         (reader_positions && virtual_kind != 0));
   if (mode == "iceberg_cast")
     CHECK(dynamic_cast<parquet_file_scan_info&>(*prepared).disable_filter_pushdown);
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(std::move(prepared));
+  if (mode == "iceberg_dynamic_before_emission") publish_dynamic();
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
   REQUIRE(splits.size() == 1);
-  if (mode == "iceberg_dynamic_late") publish_dynamic();
-  CHECK(dynamic_cast<parquet_split_info const&>(*splits.front()).requires_row_positions ==
-        reader_positions);
+  auto owned        = std::shared_ptr<scan_info>(std::move(splits.front()));
+  auto const& split = dynamic_cast<parquet_split_info const&>(*owned);
+  scan_operator_input input(
+    owned, nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
+  auto const device        = rmm::get_current_cuda_device().value();
+  auto const working_bytes = input.get_estimated_working_set_size_in_bytes(device);
+  if (mode == "iceberg_dynamic_late" || static_pending) publish_dynamic();
+  CHECK(input.get_estimated_working_set_size_in_bytes(device) == working_bytes);
+  CHECK(split.preparation_bytes() == preparation_bytes);
+  if (dynamic) {
+    CHECK(split.position_reader_filter_available(device) == actual_positions);
+    CHECK(split.reader_filter_disabled(device) == !actual_positions);
+    if (!actual_positions)
+      CHECK(working_bytes == unfiltered_bytes);
+    else
+      CHECK(working_bytes > unfiltered_bytes);
+  }
+  CHECK(split.requires_row_positions == reader_positions);
   auto context = sirius::test::get_registered_sirius_context(*con);
   auto* space  = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
   REQUIRE(space);
   rmm::cuda_stream stream;
-  auto batch =
-    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
+  auto batch = ingestible->materialize_metadata_to_table(*owned, *space, stream, false, nullptr);
   CHECK_FALSE(batch.row_positions);
   CHECK(row_requests == (actual_positions || virtual_kind == 1 ? 1 : 0));
   CHECK(source_requests == 0);  // One file's context is sufficient, even for filename output.
@@ -617,15 +686,17 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   if (dynamic) {
     REQUIRE(batch.execution);
     CHECK_FALSE(batch.execution->whole_static_complete);
-    CHECK(batch.execution->predicates.empty());
+    CHECK(batch.execution->predicates.size() == (static_pending ? 1 : 0));
     CHECK(batch.execution->visibility_complete);
     batch.execution->authoritative = true;
-    CHECK(batch.table.num_rows() == (actual_positions ? 299 : 999));
+    CHECK(batch.table.num_rows() == (static_pending ? 898 : actual_positions ? 299 : 999));
   }
   auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
   CHECK(output->num_rows() == (mode == "iceberg_all"          ? 0
                                : mode == "iceberg_partial"    ? 898
-                               : dynamic                      ? (actual_positions ? 299 : 999)
+                               : dynamic                      ? (static_pending     ? 898
+                                                                 : actual_positions ? 299
+                                                                                    : 999)
                                : mode == "iceberg_unfiltered" ? 999
                                : mode == "iceberg_cast"       ? 898
                                                               : 899));

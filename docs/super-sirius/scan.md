@@ -732,6 +732,11 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 `parquet_gpu_ingestible` and `iceberg_gpu_ingestible` share `parquet_scan_core`.
 Iceberg supplies snapshot/delete applicability and delegates masking to
 `positional_visibility`, using either reader positions or unfiltered input runs.
+Splits eligible for reader-position deletion capture dynamic filters at emission.
+Admission and decode use that snapshot and the target device's reader capability;
+pending or inapplicable filters add no internal position workspace. Late filters
+remain available to downstream dynamic-filter consumers. Static reader predicates
+and explicitly requested virtual columns continue to drive their own work.
 
 `finish_materialization()` orders mapping, visibility, residual evaluation and
 projection. `scan_execution_record` binds completed work to the scan contract,

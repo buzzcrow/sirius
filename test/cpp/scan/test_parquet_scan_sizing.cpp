@@ -450,10 +450,11 @@ TEST_CASE("Internal positions qualify after legacy grouping without extra splits
   std::size_t const decoded     = mode == "narrow" ? 2000 : 50000;
   std::size_t const alternative = 2 * decoded + 33 * 100 + 128;
   auto make_file                = [&](int index) {
-    auto file                     = std::make_unique<scan::parquet_file_scan_info>();
-    file->file_index              = index;
-    file->file_path               = std::to_string(index) + ".parquet";
-    file->disable_filter_pushdown = true;
+    auto file                        = std::make_unique<scan::parquet_file_scan_info>();
+    file->file_index                 = index;
+    file->file_path                  = std::to_string(index) + ".parquet";
+    file->disable_filter_pushdown    = true;
+    file->static_reader_filter_ready = true;
     file->set_contract_payload(
       1, {{.contract_id = 1, .split_id = 0, .input_identity = file->file_path}}, {{}});
     file->row_groups.push_back({0, decoded, decoded, 10, 100});

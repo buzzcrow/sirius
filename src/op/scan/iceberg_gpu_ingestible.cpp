@@ -303,7 +303,8 @@ void attach_delete_set(parquet_file_scan_info& file,
         group.position_working_bytes = memory::saturating_add(position_bytes, std::size_t{128});
         group.selected_deletes       = selected_deletes[i];
       } else {
-        group.decode_working_bytes = position_bytes;
+        group.unfiltered_working_bytes = group.decode_working_bytes;
+        group.decode_working_bytes     = position_bytes;
       }
     }
     if (file.defer_position_filter) {

@@ -63,6 +63,7 @@ class read_view_registry;
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;
+class dynamic_filter_snapshot;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -249,6 +250,19 @@ class parquet_split_info : public scan_info {
   // Internal-only positions are selected after legacy grouping. Their execution
   // peak must not change the additive preparation charge inherited from files.
   std::optional<std::size_t> deferred_position_working_bytes;
+  // Reader decisions are fixed when the coalescer emits this split. Dynamic
+  // eligibility is subsequently restricted to the task device, never refreshed.
+  bool static_reader_filter_ready = false;
+  std::shared_ptr<sirius::op::dynamic_filter_snapshot const> position_filter_snapshot;
+  std::size_t unfiltered_working_bytes = 0;
+
+  [[nodiscard]] bool position_reader_filter_available(
+    std::optional<int> device = std::nullopt) const noexcept;
+  [[nodiscard]] bool reader_filter_disabled(int device) const noexcept
+  {
+    return disable_filter_pushdown ||
+           (requires_row_positions && !position_reader_filter_available(device));
+  }
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
@@ -269,6 +283,19 @@ class parquet_split_info : public scan_info {
 
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
+    return position_working_set_bytes(std::nullopt);
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes_for_device(
+    int device) const noexcept override
+  {
+    return position_working_set_bytes(device);
+  }
+
+  [[nodiscard]] std::size_t position_working_set_bytes(std::optional<int> device) const noexcept
+  {
+    if (requires_row_positions && !position_reader_filter_available(device))
+      return unfiltered_working_bytes;
     if (deferred_position_working_bytes) return *deferred_position_working_bytes;
     std::size_t total = 0;
     for (auto const& s : rg_slices) {
@@ -329,6 +356,9 @@ class parquet_file_scan_info : public scan_info {
     // split can qualify the actual position working set.
     std::size_t position_working_bytes = 0;
     std::size_t selected_deletes       = 0;
+    // Virtual routes retain their preparation charge, but can omit the extra
+    // deletion-position workspace when no reader predicate is committed.
+    std::optional<std::size_t> unfiltered_working_bytes;
   };
 
   /// Parsed footer metadata for this file.
@@ -356,9 +386,10 @@ class parquet_file_scan_info : public scan_info {
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
   // Set by the core only for a route/expression with qualified original positions.
-  bool position_filter_eligible = false;
-  bool requires_row_positions   = false;
-  bool defer_position_filter    = false;
+  bool position_filter_eligible   = false;
+  bool requires_row_positions     = false;
+  bool defer_position_filter      = false;
+  bool static_reader_filter_ready = false;
   /// No projected carrier was resolved (for example an empty footer). Reader mode
   /// retains the natural-schema fallback if neither a per-file virtual-scan
   /// carrier nor the bind-selected carrier is available. Metadata-only mode does
